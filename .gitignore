@@ -1,0 +1,10 @@
+# Never commit ROMs or anything derived from one. We ship patches only.
+*.sfc
+*.smc
+*.SFC
+*.SMC
+*.bin
+roms/
+build/
+out/
+*.bps.tmp
