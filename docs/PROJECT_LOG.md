@@ -42,11 +42,11 @@ Q1–Q13 are answered (D3–D12, D17–D19). Still open:
 | D13 | 2026-10-10 | Stack (Claude's call; user can override): a **C program using raylib** that hosts the libretro core. It loads `snes9x_libretro.dll` from the user's existing RetroArch install, so no emulator is bundled. Windows .exe built by GitHub Actions. Look-and-feel settings live in hot-reloading text config and shader files. | Small and fast. Claude can build and run it end to end in the cloud session (Godot can't be downloaded here). |
 | D14 | 2026-10-10 | RAM addresses come from ebsrc's `ram.asm`, assembled with ca65 into a generated table | Exact addresses, no guessing |
 | D15 | 2026-10-10 | The ROM check lives inside FPEB.exe, not in a Python tool. Setup is drag-and-drop (core .dll and ROM onto the window), remembered in `fpeb.ini`. | User is creative-only on Windows, with no Python to run |
+| D16 | 2026-10-10 | Debug panel is **on by default**. Tab or F1 toggles it, and the choice is saved as `debug=` in `fpeb.ini`. When hidden, a faint "Tab: show debug info" hint stays on screen. Prefer non-F-keys for anything the user must press. | User couldn't see the panel (F1-only and hidden by default; laptop F-keys often need Fn) |
 | D17 | 2026-10-10 | The user will upload their ROM to the cloud session for Claude to test with. Keep it **outside the repo** (scratchpad or the git-ignored `roms/`). Cloud containers are temporary, so a later session may need to ask for it again. If the ROM is missing, say so and ask; don't re-ask the policy itself. | Q11 |
 | D18 | 2026-10-10 | No deadline; the user runs several projects. Work at a strong, steady pace and ship good builds regularly. | Q12 |
 | D19 | 2026-10-10 | Visual style: **chunky low-res pixels** (Doom/PS1/boomer-shooter feel) | Q13 |
 | D20 | 2026-10-10 | Major creative decisions are playtested before moving on. Ship them as switchable options inside one build (hotkey or settings), not as separate builds. | Q12: user asked to playtest options for major creative choices |
-| D16 | 2026-10-10 | Debug panel is **on by default**. Tab or F1 toggles it, and the choice is saved as `debug=` in `fpeb.ini`. When hidden, a faint "Tab: show debug info" hint stays on screen. Prefer non-F-keys for anything the user must press. | User couldn't see the panel (F1-only and hidden by default; laptop F-keys often need Fn) |
 
 ## Session History
 
