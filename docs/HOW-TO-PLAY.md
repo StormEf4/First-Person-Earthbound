@@ -23,6 +23,20 @@ Extra keys:
                 It's on by default and remembers your choice.
   F5 = save state    F9 = load state
 
+3D world view (Phase 1 preview):
+  V = switch between the normal game and the 3D world view.
+      The view starts where Ness is standing (or at his front door before
+      the game reaches the overworld). The game keeps running but ignores
+      your input while you're looking around.
+  W A S D = move     Arrow keys or hold right mouse = turn and look
+  Space / C = fly up / down     Shift = move fast     R = jump back to Ness
+  Gamepad: left stick move, right stick look, LB/RB down/up.
+
+  Creative options. Press the number key to cycle each one. Your picks
+  are saved in fpeb.ini:
+  1 Resolution      2 Wall style      3 Wall height
+  4 Fog / draw distance      5 Lighting mood      6 Map palette (day/night)
+
 Saves: in-game saves go in a .srm file next to your ROM. To continue a save from
 RetroArch, copy your EarthBound .srm from RetroArch's "saves" folder to sit next
 to the ROM, with the same name as the ROM.

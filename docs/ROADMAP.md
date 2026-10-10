@@ -16,11 +16,10 @@ Major creative choices ship as **switchable options inside the build** (D20). Th
 - ✅ 🟡 **User playtest passed:** game, sound, X/Y, and facing (0 up, 2 right, 4 down, 6 left) all accurate.
 
 ## Phase 1 — The world in 3D (2–3 sessions)
-- Read map tiles, tilesets, palettes, and collision for the Onett area directly from the user's ROM at startup (no assets shipped).
-- Build 3D geometry: floor from ground tiles, walls raised from collision, building fronts textured with their own tile art (D11). Night palette.
-- A free-fly camera to look around.
-- Chunky low-res look (D19), with several resolution and pixel-size presets to flip between.
-- 🟡 **User:** fly around Onett and flip between the presets. Pick wall height, fog and draw distance, resolution and pixel size, and lighting mood.
+- ✅ ROM decoder (`src/eb_world.c`): map, sectors, 20 tilesets, palettes (including story-event variants), and collision, decoded at startup from the user's ROM. HAL decompression is implemented. `ebmapdump` renders any area top-down for checking.
+- ✅ 3D builder (`src/world3d.c`): floor from map tiles; walls from solid collision, in two styles: **Facades** (each solid column stands up so the oblique art becomes the front wall) and **Blocks** (diorama). Texture atlas filled on demand, built per sector with fog distance culling.
+- ✅ Free-fly viewer (`src/viewer.c`), opened with V. Six switchable options (D20): resolution, wall style, wall height, fog, mood, palette.
+- 🟡 **User:** fly around Onett and pick a value for each option. Note anything that looks wrong (trees, cliffs, fences, roofs).
 
 ## Phase 2 — Seeing through Ness's eyes (2–3 sessions)
 - The camera sits at Ness's real position. Free movement and turning (D7): mouse or right stick turns, and movement is fed to the game so its own collision, doors, and triggers still fire.

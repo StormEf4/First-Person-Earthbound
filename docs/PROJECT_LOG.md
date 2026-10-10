@@ -14,6 +14,8 @@ The single source of truth for decisions. Newest entries at the bottom of each s
 - **Hardware reality:** a stock SNES CPU (~3.58 MHz 65816) can only render a small, low-framerate raycast view. That's why we chose the emulator-assisted route (D5).
 - **Distribution:** our own code plus, if needed, a small .bps patch. No ROM data and no emulator binaries in the repo (`.gitignore` keeps ROMs out).
 - **RAM symbols:** ebsrc's `src/bankconfig/common/ram.asm` lays out all of WRAM ($7E0000 and up) by name, e.g. `GAME_STATE`, `CURRENT_LEADER_DIRECTION`, `BATTLE_MODE`, `PLAYER_POSITION_BUFFER`. We build those into an address table instead of guessing addresses.
+- **Map data (headerless US ROM file offsets):** map rows via the 3-byte pointer at `0xA1DB` (8 row groups); extra tile bits at `0x175000`; sector byte (tileset<<3 | palette) at `0x17A800`, 32x80 sectors of 8x4 map tiles; map tileset to drawing tileset at `0x2F101B`; pointer tables for graphics `0x2F105B`, arrangements `0x2F10AB`, palettes `0x2F10FB` (0xC0 bytes each, 6 subpalettes; an arrangement's palette bits minus 2 gives the subpalette), and collision `0x2F117B` (u16 offsets into `0x180000`). Graphics and arrangements are HAL-compressed. Collision bit 0x80 = solid, 0x10 = ladder/stairs, 0x08/0x0C = water, 0x01/0x02 = hides Ness's lower/upper body. Palettes with a nonzero u16 at +0 have an event-flag variant at `0x1A0000 | u16@+0x20`; **for Onett that variant is the night palette.**
+- **Ness's front door** is at about pixel (2400, 343).
 - **Cloud session network:** github.com git clones work; GitHub release downloads and buildbot.libretro.com are blocked; PyPI works. So we build tools from source (cc65, snes9x core, raylib).
 
 ## Open questions
@@ -61,9 +63,13 @@ Q1–Q13 are answered (D3–D12, D17–D19). Still open:
 - User playtest #1: the game ran, but "no info HUD visible". Fixed per D16; new build pushed.
 - User playtest #2: **Phase 0 passed.** Game, sound, Ness X/Y, and facing are all accurate on the real ROM on Windows. The user confirmed facing values 0 up, 6 left, 4 down, 2 right. Q11–Q13 answered (D17–D19, D20).
 - **Next:** the user uploads the ROM. Then Phase 1: decode Onett's map, tileset, palette, and collision from the ROM, and build the free-fly 3D view with resolution presets.
+- ROM uploaded and copied to `roms/earthbound.smc` (git-ignored). It's the clean US dump (CRC32 DC9BB451, with a 512-byte header). The original upload is at `/root/.claude/uploads/<session>/…Earthbound_U_.smc`.
+- Phase 1 built: ROM map decoder, 3D world builder (Facades and Blocks styles), free-fly viewer with six creative options. Verified with the real ROM in the cloud: screenshots at Ness's door, downtown Onett, and overhead, in both palettes and several moods.
+- **Next:** the user picks the Phase 1 options (🟡). Then Phase 2: camera follows Ness from RAM, free movement fed to the game, and game text boxes overlaid. Pick the palette automatically from the event flag in RAM.
 
 ### How to test in a cloud session (so it doesn't need re-deriving)
 - Tools from source into /tmp: `git clone --branch V2.19 https://github.com/cc65/cc65 && make -C cc65 bin`; `git clone https://github.com/libretro/snes9x && make -C snes9x/libretro`.
 - Linux build needs: `apt-get install libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev libasound2-dev`.
 - Test ROM: `ca65 tests/testrom/testrom.s -o t.o && ld65 -C tests/testrom/testrom.cfg -o testrom.sfc t.o`.
+- Screenshot the 3D view with the real ROM: `FPEB --rom $PWD/../roms/earthbound.smc --core ... --view3d --cam PX PY YAWDEG PITCHDEG [--cam-y UNITS] [--set walls=1 ...] --frames 45 --screenshot x.png`. Put `debug=0` in `build/fpeb.ini` to hide the panel. Run these one at a time, since they share fpeb.ini.
 - Run: `xvfb-run -a ./build/FPEB --rom /abs/testrom.sfc --core /abs/snes9x_libretro.so --any-rom --debug --frames 120 --screenshot shot.png`. raylib saves the screenshot in the program's folder, whatever path you give.

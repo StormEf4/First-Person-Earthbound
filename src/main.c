@@ -7,9 +7,11 @@
 #include "raylib.h"
 
 #include "eb_ram.h"
+#include "eb_world.h"
 #include "log.h"
 #include "lr_host.h"
 #include "rom_check.h"
+#include "viewer.h"
 
 #define APP_TITLE "First-Person EarthBound"
 #define CONFIG_FILE "fpeb.ini"
@@ -30,6 +32,11 @@ typedef struct {
 
 static Config cfg = {.debug = 1};
 static char status[512];
+static bool world_ok; /* overworld data decoded from the ROM */
+
+/* Where the 3D view starts when Ness isn't on the overworld yet: outside his house. */
+#define NESS_HOUSE_PX 2400
+#define NESS_HOUSE_PY 400
 
 /* ---- config file: plain key=value lines ---- */
 
@@ -46,6 +53,7 @@ static void config_load(void)
         if (strcmp(line, "rom") == 0) snprintf(cfg.rom, sizeof cfg.rom, "%s", eq + 1);
         if (strcmp(line, "core") == 0) snprintf(cfg.core, sizeof cfg.core, "%s", eq + 1);
         if (strcmp(line, "debug") == 0) cfg.debug = atoi(eq + 1) != 0;
+        viewer_config_read(line, eq + 1);
     }
     fclose(f);
 }
@@ -55,6 +63,7 @@ static void config_save(void)
     FILE *f = fopen(CONFIG_FILE, "w");
     if (!f) return;
     fprintf(f, "rom=%s\ncore=%s\ndebug=%d\n", cfg.rom, cfg.core, cfg.debug);
+    viewer_config_write(f);
     fclose(f);
 }
 
@@ -220,7 +229,10 @@ static bool start_game(bool allow_any_rom)
         free(data);
         return false;
     }
-    /* `data` stays allocated while the game runs: libretro lets the core keep pointing at it. */
+    /* `data` stays allocated while the game runs: libretro lets the core keep pointing at it,
+     * and the 3D world reads map data from it. */
+    world_ok = ebw_load(data + info.header_size, size - info.header_size, err, sizeof err);
+    if (!world_ok) log_msg("Map data unavailable: %s\n", err);
     sram_paths();
     sram_load();
     return true;
@@ -242,6 +254,7 @@ static void draw_debug_panel(void)
     snprintf(buf, sizeof buf,
              "Tab or F1: hide this panel\n"
              "F5: save state   F9: load state\n"
+             "V: 3D world view\n"
              "\n"
              "Ness X        %5u\n"
              "Ness Y        %5u\n"
@@ -255,7 +268,7 @@ static void draw_debug_panel(void)
              lr_peek16(EB_LEADER_X), lr_peek16(EB_LEADER_Y), dir, direction_name(dir),
              lr_peek16(EB_WALKING_STYLE), lr_peek8(EB_PARTY_COUNT), lr_peek16(EB_BATTLE_MODE_FLAG),
              lr_peek16(EB_BATTLE_MODE), lr_peek8(EB_FRAME_COUNTER), lr_audio_available());
-    DrawRectangle(8, 8, 380, 270, Fade(BLACK, 0.75f));
+    DrawRectangle(8, 8, 380, 290, Fade(BLACK, 0.75f));
     DrawText(buf, 18, 18, 18, RAYWHITE);
 }
 
@@ -314,7 +327,9 @@ int main(int argc, char **argv)
      * --debug (start with the F1 panel open). Paths are relative to the program's folder. */
     long test_frames = -1;
     const char *screenshot = NULL;
-    bool allow_any_rom = false, force_debug = false;
+    bool allow_any_rom = false, force_debug = false, view3d = false;
+    float cam[4] = {-1, -1, 0, 0}; /* --cam px py yaw pitch */
+    float cam_y = -1;                /* --cam-y units */
 
     /* Keep config, log, and saves next to the program even if launched from elsewhere. */
     ChangeDirectory(GetApplicationDirectory());
@@ -327,6 +342,19 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc) screenshot = argv[++i];
         else if (!strcmp(argv[i], "--any-rom")) allow_any_rom = true;
         else if (!strcmp(argv[i], "--debug")) force_debug = true;
+        else if (!strcmp(argv[i], "--view3d")) view3d = true;
+        else if (!strcmp(argv[i], "--cam") && i + 4 < argc)
+            for (int k = 0; k < 4; k++) cam[k] = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--cam-y") && i + 1 < argc) cam_y = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--set") && i + 1 < argc) {
+            char kv[128];
+            snprintf(kv, sizeof kv, "%s", argv[++i]);
+            char *eq = strchr(kv, '=');
+            if (eq) {
+                *eq = 0;
+                viewer_config_read(kv, eq + 1);
+            }
+        }
     }
     if (force_debug) cfg.debug = 1;
     find_core();
@@ -335,9 +363,20 @@ int main(int argc, char **argv)
     InitWindow(1024, 768, APP_TITLE);
     SetTargetFPS(60);
     SetExitKey(KEY_NULL);
+    viewer_init();
 
     bool running = cfg.core[0] && cfg.rom[0] && start_game(allow_any_rom);
     if (running) config_save();
+    view3d = view3d && world_ok;
+    if (view3d) {
+        if (cam[0] >= 0) {
+            viewer_place(cam[0], cam[1], 0);
+            viewer_set_angles(cam[2], cam[3]);
+            if (cam_y > 0) viewer_set_height(cam_y);
+        } else {
+            viewer_place(NESS_HOUSE_PX, NESS_HOUSE_PY, 0);
+        }
+    }
 
     InitAudioDevice();
     AudioStream stream = {0};
@@ -379,7 +418,23 @@ int main(int argc, char **argv)
             if (IsKeyPressed(KEY_F5)) log_msg(lr_save_state(state_path) ? "State saved\n" : "State save failed\n");
             if (IsKeyPressed(KEY_F9)) log_msg(lr_load_state(state_path) ? "State loaded\n" : "No state to load\n");
 
-            lr_set_buttons(read_buttons());
+            /* V: switch between the game and the 3D world view. R in 3D: jump to Ness. */
+            bool to_ness = false;
+            if (IsKeyPressed(KEY_V) && world_ok) {
+                view3d = !view3d;
+                to_ness = view3d;
+            }
+            if (view3d && IsKeyPressed(KEY_R)) to_ness = true;
+            if (to_ness) {
+                unsigned nx = lr_peek16(EB_LEADER_X), ny = lr_peek16(EB_LEADER_Y);
+                bool on_map = nx > 0 && ny > 0 && nx < EBW_MAP_W * 32 && ny < EBW_MAP_H * 32;
+                if (on_map) viewer_place((float)nx, (float)ny, lr_peek16(EB_LEADER_DIRECTION));
+                else viewer_place(NESS_HOUSE_PX, NESS_HOUSE_PY, 0);
+            }
+            if (view3d && viewer_update(GetFrameTime())) config_save();
+
+            /* The game keeps running (music and all) but ignores input while you look around. */
+            lr_set_buttons(view3d ? 0 : read_buttons());
             lr_run_frame();
             /* The SNES runs at ~60.1 fps and we draw at 60: run an extra frame when audio runs low. */
             if (audio_ok && lr_audio_available() < AUDIO_CHUNK) lr_run_frame();
@@ -413,7 +468,9 @@ int main(int argc, char **argv)
         }
 
         BeginDrawing();
-        if (running) {
+        if (running && view3d) {
+            viewer_draw(cfg.debug);
+        } else if (running) {
             ClearBackground(BLACK);
             if (tex.id) draw_game_texture(tex, tex_w, tex_h);
             if (cfg.debug) draw_debug_panel();
@@ -438,6 +495,8 @@ int main(int argc, char **argv)
     }
     if (audio_ok) UnloadAudioStream(stream);
     if (tex.id) UnloadTexture(tex);
+    viewer_shutdown();
+    ebw_free();
     CloseAudioDevice();
     CloseWindow();
     free(sram_shadow);
