@@ -10,8 +10,8 @@
 
 #define EYE_HEIGHT 2.5f /* world units (minitiles); about Ness's eye level */
 
-/* Defaults: PS1 resolution, facades, original proportions, medium fog, original colours. */
-static W3dOptions opt = {{2, 0, 1, 1, 0, 0}};
+/* Defaults are the user's Phase 1 picks (D21): 640x360, facades, light fog. */
+static W3dOptions opt = {{4, 0, 2, 0, 0}};
 static Vector3 pos;
 static float yaw, pitch; /* radians; yaw 0 looks north (-z) */
 static RenderTexture2D target;
@@ -62,11 +62,11 @@ static Vector3 forward(void) { return (Vector3){sinf(yaw), 0, -cosf(yaw)}; }
 bool viewer_update(float dt)
 {
     bool changed = false;
-    static const int keys[OPT_COUNT] = {KEY_ONE, KEY_TWO, KEY_THREE, KEY_FOUR, KEY_FIVE, KEY_SIX};
+    static const int keys[OPT_COUNT] = {KEY_ONE, KEY_TWO, KEY_THREE, KEY_FOUR, KEY_FIVE};
     for (int i = 0; i < OPT_COUNT; i++)
         if (IsKeyPressed(keys[i])) {
             opt.value[i] = (opt.value[i] + 1) % w3d_option_count(i);
-            if (i == OPT_WALL_STYLE || i == OPT_WALL_HEIGHT || i == OPT_PALETTE) w3d_invalidate();
+            if (i == OPT_WALL_STYLE || i == OPT_PALETTE) w3d_invalidate();
             changed = true;
         }
 

@@ -16,6 +16,8 @@ The single source of truth for decisions. Newest entries at the bottom of each s
 - **RAM symbols:** ebsrc's `src/bankconfig/common/ram.asm` lays out all of WRAM ($7E0000 and up) by name, e.g. `GAME_STATE`, `CURRENT_LEADER_DIRECTION`, `BATTLE_MODE`, `PLAYER_POSITION_BUFFER`. We build those into an address table instead of guessing addresses.
 - **Map data (headerless US ROM file offsets):** map rows via the 3-byte pointer at `0xA1DB` (8 row groups); extra tile bits at `0x175000`; sector byte (tileset<<3 | palette) at `0x17A800`, 32x80 sectors of 8x4 map tiles; map tileset to drawing tileset at `0x2F101B`; pointer tables for graphics `0x2F105B`, arrangements `0x2F10AB`, palettes `0x2F10FB` (0xC0 bytes each, 6 subpalettes; an arrangement's palette bits minus 2 gives the subpalette), and collision `0x2F117B` (u16 offsets into `0x180000`). Graphics and arrangements are HAL-compressed. Collision bit 0x80 = solid, 0x10 = ladder/stairs, 0x08/0x0C = water, 0x01/0x02 = hides Ness's lower/upper body. Palettes with a nonzero u16 at +0 have an event-flag variant at `0x1A0000 | u16@+0x20`; **for Onett that variant is the night palette.**
 - **Ness's front door** is at about pixel (2400, 343).
+- **Indoor flag:** the sector misc table at `0x17B200` has 2 bytes per sector; `byte0 & 7` is the setting (1 = indoors, 7 = indoors with butterflies).
+- **3D object classes** (world3d.c `analyse_world`): props are ≤6x6 minitiles and ≤30 cells, outdoors. Foliage is ≥50% green pixels on the day palette, or thin (≤2 wide or tall). Terrain is wider or taller than 48, or area >200 with fill <0.5. Everything else is a building. Debug with `--class-map`: yellow prop, cyan foliage, blue terrain, red building.
 - **Cloud session network:** github.com git clones work; GitHub release downloads and buildbot.libretro.com are blocked; PyPI works. So we build tools from source (cc65, snes9x core, raylib).
 
 ## Open questions
@@ -49,6 +51,11 @@ Q1–Q13 are answered (D3–D12, D17–D19). Still open:
 | D18 | 2026-10-10 | No deadline; the user runs several projects. Work at a strong, steady pace and ship good builds regularly. | Q12 |
 | D19 | 2026-10-10 | Visual style: **chunky low-res pixels** (Doom/PS1/boomer-shooter feel) | Q13 |
 | D20 | 2026-10-10 | Major creative decisions are playtested before moving on. Ship them as switchable options inside one build (hotkey or settings), not as separate builds. | Q12: user asked to playtest options for major creative choices |
+| D21 | 2026-10-10 | Phase 1 picks: **640x360** resolution, **Facades** wall style, **Light** fog. Performance was fine: steady high fps on the user's PC. | Phase 1 🟡 playtest |
+| D22 | 2026-10-10 | Facades must be "rounded out": no staircase or voxel look where every pixel row adds height. Objects get clean, consistent shapes. Most things look ugly and need touching up; Claude audits visually with its own cloud screenshot pipeline and fixes without waiting. | User feedback on Phase 1 |
+| D23 | 2026-10-10 | Wall height is decided by context, not chosen by the player: **low indoors, tall outdoors**. Use the sector's Indoors setting. | User |
+| D24 | 2026-10-10 | Lighting mood and day/night palette **change with context** (scene, story, mood), driven by game state rather than a player setting. The Phase 1 hotkeys stay as debug overrides. | User |
+| D25 | 2026-10-10 | Claude has no access to the user's screen or capture software in cloud sessions. Visual checks use FPEB screenshots taken in the cloud with the user's ROM (see the "How to test" notes). | The user believed screen capture had been set up; it isn't reachable from here |
 
 ## Session History
 
@@ -66,6 +73,9 @@ Q1–Q13 are answered (D3–D12, D17–D19). Still open:
 - ROM uploaded and copied to `roms/earthbound.smc` (git-ignored). It's the clean US dump (CRC32 DC9BB451, with a 512-byte header). The original upload is at `/root/.claude/uploads/<session>/…Earthbound_U_.smc`.
 - Phase 1 built: ROM map decoder, 3D world builder (Facades and Blocks styles), free-fly viewer with six creative options. Verified with the real ROM in the cloud: screenshots at Ness's door, downtown Onett, and overhead, in both palettes and several moods.
 - **Next:** the user picks the Phase 1 options (🟡). Then Phase 2: camera follows Ness from RAM, free movement fed to the game, and game text boxes overlaid. Pick the palette automatically from the event flag in RAM.
+- User playtest #3 (Phase 1): picks recorded as D21–D24. The user believed screen capture had been set up for Claude; it isn't reachable from a cloud session (D25), so Claude used its own FPEB screenshot audit (`/tmp/audit.sh`-style: 8 fixed Onett views at the user's settings).
+- "Rounded out" pass on world3d.c: object labelling (connected solid areas), with classes prop / foliage and thin (cut-outs) / building (uniform storeys) / terrain (low ledges). Ground-colour keying with a floor patch erases the flat copy under cut-outs, and side walls borrow siding art. Before and after screenshots were sent to the user.
+- **Next:** the user re-checks the look. Then Phase 2 (camera follows Ness, movement, text overlay, palette and mood from game state).
 
 ### How to test in a cloud session (so it doesn't need re-deriving)
 - Tools from source into /tmp: `git clone --branch V2.19 https://github.com/cc65/cc65 && make -C cc65 bin`; `git clone https://github.com/libretro/snes9x && make -C snes9x/libretro`.

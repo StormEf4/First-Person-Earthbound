@@ -32,10 +32,12 @@ Extra keys:
   Space / C = fly up / down     Shift = move fast     R = jump back to Ness
   Gamepad: left stick move, right stick look, LB/RB down/up.
 
-  Creative options. Press the number key to cycle each one. Your picks
-  are saved in fpeb.ini:
-  1 Resolution      2 Wall style      3 Wall height
-  4 Fog / draw distance      5 Lighting mood      6 Map palette (day/night)
+  Options. Press the number key to cycle each one. Your picks are saved
+  in fpeb.ini:
+  1 Resolution      2 Wall style      3 Fog / draw distance
+  4 Lighting mood   5 Map palette (day/night)
+  Wall height is automatic: low indoors, tall outdoors. Mood and palette
+  will follow the story automatically later; for now the keys override them.
 
 Saves: in-game saves go in a .srm file next to your ROM. To continue a save from
 RetroArch, copy your EarthBound .srm from RetroArch's "saves" folder to sit next

@@ -9,6 +9,7 @@
 #define MAP_POINTERS_PTR 0x00A1DB      /* 3-byte SNES pointer to 8 row-group pointers */
 #define LOCAL_TILESETS 0x175000        /* high 2 bits of each map tile */
 #define SECTOR_TILESET_PALETTE 0x17A800 /* 1 byte per sector: tileset << 3 | palette */
+#define SECTOR_MISC 0x17B200           /* 2 bytes per sector: teleport<<7 | townmap<<3 | setting, item */
 #define MAP_TILESET_TO_GFX 0x2F101B    /* 32 x u16: map tileset -> drawing tileset */
 #define GFX_POINTERS 0x2F105B          /* 20 x u32 SNES pointers, compressed 4bpp minitiles */
 #define ARRANGEMENT_POINTERS 0x2F10AB  /* 20 x u32, compressed 4x4 minitile arrangements */
@@ -34,6 +35,7 @@ static const uint8_t *rom;
 static size_t rom_size;
 static uint16_t map_tiles[EBW_MAP_H][EBW_MAP_W];
 static uint8_t sector_info[EBW_SECTORS_Y][EBW_SECTORS_X];
+static uint8_t sector_setting[EBW_SECTORS_Y][EBW_SECTORS_X];
 static uint8_t map_to_gfx[NUM_MAP_TILESETS];
 static GfxTileset *gfx[NUM_GFX_TILESETS];
 
@@ -174,6 +176,8 @@ bool ebw_load(const uint8_t *data, size_t size, char *err, size_t errlen)
             }
 
     memcpy(sector_info, rom + SECTOR_TILESET_PALETTE, sizeof sector_info);
+    for (int i = 0; i < EBW_SECTORS_X * EBW_SECTORS_Y; i++)
+        sector_setting[i / EBW_SECTORS_X][i % EBW_SECTORS_X] = rom[SECTOR_MISC + i * 2] & 7;
     for (int i = 0; i < NUM_MAP_TILESETS; i++) map_to_gfx[i] = (uint8_t)rd16(MAP_TILESET_TO_GFX + i * 2);
     return true;
 }
@@ -196,6 +200,13 @@ int ebw_tileset_at(int tx, int ty)
 int ebw_palette_at(int tx, int ty)
 {
     return in_map(tx, ty) ? sector_info[ty / EBW_SECTOR_H][tx / EBW_SECTOR_W] & 7 : 0;
+}
+
+bool ebw_indoors_at(int tx, int ty)
+{
+    if (!in_map(tx, ty)) return false;
+    int setting = sector_setting[ty / EBW_SECTOR_H][tx / EBW_SECTOR_W];
+    return setting == 1 || setting == 7; /* "Indoors", "Indoors and butterflies" */
 }
 
 uint16_t ebw_tile_at(int tx, int ty) { return in_map(tx, ty) ? map_tiles[ty][tx] : 0; }

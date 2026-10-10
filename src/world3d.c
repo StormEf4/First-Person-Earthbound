@@ -17,7 +17,6 @@ static const struct {
 } option_info[OPT_COUNT] = {
     [OPT_RESOLUTION] = {"Resolution", "res", 5, {"256x224 (SNES)", "320x200 (Doom)", "320x240 (PS1)", "400x225 (wide)", "640x360 (sharper)"}},
     [OPT_WALL_STYLE] = {"Wall style", "walls", 2, {"Facades (art stands up)", "Blocks (diorama)"}},
-    [OPT_WALL_HEIGHT] = {"Wall height", "height", 4, {"Low", "Original proportions", "Tall", "Towering"}},
     [OPT_FOG] = {"Fog / draw distance", "fog", 4, {"Thick", "Medium", "Light", "None"}},
     [OPT_MOOD] = {"Lighting mood", "mood", 4, {"Original colors", "Night", "Dusk", "Eerie"}},
     [OPT_PALETTE] = {"Map palette", "palette", 2, {"Normal (day)", "Story-event variant (Onett: night)"}},
@@ -42,10 +41,39 @@ void w3d_resolution(const W3dOptions *opt, int *w, int *h, float *display_aspect
     *display_aspect = (i <= 2) ? 4.0f / 3.0f : (float)*w / (float)*h;
 }
 
-static float wall_scale(const W3dOptions *opt)
+/* Context-driven wall height (D23): low indoors, tall outdoors. */
+#define OUTDOOR_SCALE 1.25f /* world units per stood-up minitile row */
+#define INDOOR_SCALE 1.0f
+#define OUTDOOR_MAX_LEVELS 12
+#define INDOOR_MAX_LEVELS 4
+#define TERRAIN_LEVELS 2 /* cliffs and ledges: a step up in the ground, not a skyscraper */
+
+/* ---- source pixels: rendered map tiles, cached ---- */
+
+#define TILE_CACHE 2048
+static struct {
+    int key;
+    uint32_t px[32 * 32];
+} *tile_cache;
+
+static const uint32_t *tile_pixels(int tx, int ty, bool event)
 {
-    static const float s[] = {0.6f, 1.0f, 1.5f, 2.2f};
-    return s[opt->value[OPT_WALL_HEIGHT]];
+    static const uint32_t empty[32 * 32];
+    if (tx < 0 || ty < 0 || tx >= EBW_MAP_W || ty >= EBW_MAP_H) return empty;
+    int key = (ty * EBW_MAP_W + tx) << 1 | (event ? 1 : 0);
+    unsigned h = ((unsigned)key * 2654435761u) % TILE_CACHE;
+    if (tile_cache[h].key != key) {
+        ebw_render_tile(ebw_tileset_at(tx, ty), ebw_palette_at(tx, ty), ebw_tile_at(tx, ty), event,
+                        tile_cache[h].px, 32);
+        tile_cache[h].key = key;
+    }
+    return tile_cache[h].px;
+}
+
+static uint32_t pixel_at(int px, int py, bool event)
+{
+    if (px < 0 || py < 0) return 0;
+    return tile_pixels(px >> 5, py >> 5, event)[(py & 31) * 32 + (px & 31)];
 }
 
 /* ---- texture atlas of 32x32 map tiles, filled on demand ---- */
@@ -54,52 +82,409 @@ static float wall_scale(const W3dOptions *opt)
 #define ATLAS_SLOTS_PER_ROW (ATLAS_SIZE / 32)
 #define ATLAS_SLOTS (ATLAS_SLOTS_PER_ROW * ATLAS_SLOTS_PER_ROW)
 #define KEY_COUNT (1 << 19) /* tileset(5) | palette(3) | event(1) | tile(10) */
+#define MAP_TILES (EBW_MAP_W * EBW_MAP_H)
 
 static Texture2D atlas;
 static int32_t *slot_of_key;
+static int32_t *slot_of_cleaned; /* [event][map tile]: floor tiles with props erased */
 static int slots_used;
-static bool atlas_full; /* flying far fills it; it's cleared and refilled on the next frame */
+static bool atlas_full; /* flying far fills it; everything is rebuilt on the next frame */
 
-static int atlas_slot(int tileset, int palette, bool event, uint16_t tile)
+static int new_slot(const uint32_t *px)
 {
-    int key = (tileset & 31) << 14 | (palette & 7) << 11 | (event ? 1 : 0) << 10 | (tile & 1023);
-    if (slot_of_key[key] >= 0) return slot_of_key[key];
     if (slots_used >= ATLAS_SLOTS) {
         atlas_full = true;
         return 0;
     }
     int slot = slots_used++;
-    uint32_t px[32 * 32];
-    ebw_render_tile(tileset, palette, tile, event, px, 32);
     Rectangle r = {(float)(slot % ATLAS_SLOTS_PER_ROW * 32), (float)(slot / ATLAS_SLOTS_PER_ROW * 32), 32, 32};
     UpdateTextureRec(atlas, r, px);
-    slot_of_key[key] = slot;
     return slot;
 }
 
-/* UV rectangle of one 8x8 minitile (sub = 0..15 within its map tile). */
+static int atlas_slot(int tx, int ty, bool event)
+{
+    int key = (ebw_tileset_at(tx, ty) & 31) << 14 | (ebw_palette_at(tx, ty) & 7) << 11 | (event ? 1 : 0) << 10 |
+              (ebw_tile_at(tx, ty) & 1023);
+    if (slot_of_key[key] < 0) slot_of_key[key] = new_slot(tile_pixels(tx, ty, event));
+    return slot_of_key[key];
+}
+
 typedef struct {
     float u0, v0, u1, v1;
 } UvRect;
 
-static UvRect minitile_uv(int slot, int sub)
+static UvRect slot_uv(int slot, int x, int y, int w, int h)
 {
     const float inset = 0.02f / ATLAS_SIZE;
-    float x = (float)(slot % ATLAS_SLOTS_PER_ROW * 32 + (sub & 3) * 8);
-    float y = (float)(slot / ATLAS_SLOTS_PER_ROW * 32 + (sub >> 2) * 8);
-    return (UvRect){x / ATLAS_SIZE + inset, y / ATLAS_SIZE + inset, (x + 8) / ATLAS_SIZE - inset,
-                    (y + 8) / ATLAS_SIZE - inset};
+    float ax = (float)(slot % ATLAS_SLOTS_PER_ROW * 32 + x), ay = (float)(slot / ATLAS_SLOTS_PER_ROW * 32 + y);
+    return (UvRect){ax / ATLAS_SIZE + inset, ay / ATLAS_SIZE + inset, (ax + w) / ATLAS_SIZE - inset,
+                    (ay + h) / ATLAS_SIZE - inset};
 }
 
-static UvRect maptile_uv(int slot)
+static UvRect minitile_uv(int mx, int my, bool event)
 {
-    const float inset = 0.02f / ATLAS_SIZE;
-    float x = (float)(slot % ATLAS_SLOTS_PER_ROW * 32), y = (float)(slot / ATLAS_SLOTS_PER_ROW * 32);
-    return (UvRect){x / ATLAS_SIZE + inset, y / ATLAS_SIZE + inset, (x + 32) / ATLAS_SIZE - inset,
-                    (y + 32) / ATLAS_SIZE - inset};
+    return slot_uv(atlas_slot(mx >> 2, my >> 2, event), (mx & 3) * 8, (my & 3) * 8, 8, 8);
 }
 
-/* ---- mesh building ---- */
+/* ---- objects: connected solid areas of the collision map ---- */
+
+typedef struct {
+    int x0, y0, x1, y1, cells;
+    int depth_sum, runs;
+    bool is_prop, prop_made, indoors;
+    bool foliage; /* trees and hedges: drawn as cut-out strips, never as boxes */
+    bool terrain; /* cliffs and ledges: long, sprawling, and kept low */
+    int levels;
+} Object;
+
+static bool looks_like_prop(const Object *o);
+
+static uint8_t *solid_grid;
+static int32_t *object_of; /* per minitile, -1 when open */
+static Object *objects;
+static int object_count;
+static bool analysed;
+
+static bool solid(int mx, int my)
+{
+    return mx >= 0 && my >= 0 && mx < EBW_MINI_W && my < EBW_MINI_H && solid_grid[my * EBW_MINI_W + mx];
+}
+
+static int object_at(int mx, int my)
+{
+    return (mx >= 0 && my >= 0 && mx < EBW_MINI_W && my < EBW_MINI_H) ? object_of[my * EBW_MINI_W + mx] : -1;
+}
+
+/* Labels every solid area once, so objects that cross chunk borders get one consistent shape. */
+static void analyse_world(void)
+{
+    const int n = EBW_MINI_W * EBW_MINI_H;
+    solid_grid = malloc(n);
+    object_of = malloc(sizeof(int32_t) * n);
+    int32_t *stack = malloc(sizeof(int32_t) * n);
+    int cap = 4096;
+    objects = malloc(sizeof(Object) * cap);
+    object_count = 0;
+
+    for (int my = 0; my < EBW_MINI_H; my++)
+        for (int mx = 0; mx < EBW_MINI_W; mx++)
+            solid_grid[my * EBW_MINI_W + mx] = (ebw_collision_at(mx, my) & EBW_SOLID) != 0;
+    memset(object_of, 0xFF, sizeof(int32_t) * n);
+
+    for (int start = 0; start < n; start++) {
+        if (!solid_grid[start] || object_of[start] >= 0) continue;
+        if (object_count == cap) {
+            cap *= 2;
+            objects = realloc(objects, sizeof(Object) * cap);
+        }
+        Object *o = &objects[object_count];
+        memset(o, 0, sizeof *o);
+        o->x0 = o->y0 = 1 << 30;
+        int sp = 0;
+        stack[sp++] = start;
+        object_of[start] = object_count;
+        while (sp) {
+            int c = stack[--sp], x = c % EBW_MINI_W, y = c / EBW_MINI_W;
+            o->cells++;
+            if (x < o->x0) o->x0 = x;
+            if (x > o->x1) o->x1 = x;
+            if (y < o->y0) o->y0 = y;
+            if (y > o->y1) o->y1 = y;
+            const int nb[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+            for (int k = 0; k < 4; k++) {
+                int nx = x + nb[k][0], ny = y + nb[k][1];
+                if (nx < 0 || ny < 0 || nx >= EBW_MINI_W || ny >= EBW_MINI_H) continue;
+                int ni = ny * EBW_MINI_W + nx;
+                if (solid_grid[ni] && object_of[ni] < 0) {
+                    object_of[ni] = object_count;
+                    stack[sp++] = ni;
+                }
+            }
+        }
+        object_count++;
+    }
+
+    /* Average depth of each object's vertical runs: how far its art extends "up" the screen. */
+    for (int mx = 0; mx < EBW_MINI_W; mx++) {
+        int run_obj = -1, run_len = 0;
+        for (int my = 0; my <= EBW_MINI_H; my++) {
+            int o = my < EBW_MINI_H ? object_of[my * EBW_MINI_W + mx] : -1;
+            if (o == run_obj && o >= 0) {
+                run_len++;
+                continue;
+            }
+            if (run_obj >= 0) {
+                objects[run_obj].depth_sum += run_len;
+                objects[run_obj].runs++;
+            }
+            run_obj = o;
+            run_len = 1;
+        }
+    }
+
+    for (int i = 0; i < object_count; i++) {
+        Object *o = &objects[i];
+        o->indoors = ebw_indoors_at(o->x0 >> 2, o->y1 >> 2);
+        o->is_prop = looks_like_prop(o);
+        float avg = o->runs ? (float)o->depth_sum / o->runs : 1;
+        if (o->indoors) {
+            o->levels = (int)(avg + 0.5f);
+            if (o->levels > INDOOR_MAX_LEVELS) o->levels = INDOOR_MAX_LEVELS;
+            if (o->levels < 1) o->levels = 1;
+        } else {
+            o->levels = ((int)(avg + 1.0f) / 2) * 2; /* whole "storeys" of two rows: no stair-steps */
+            if (o->levels > OUTDOOR_MAX_LEVELS) o->levels = OUTDOOR_MAX_LEVELS;
+            if (o->levels < 2) o->levels = 2;
+        }
+    }
+    /* Foliage: mostly green art (judged on the day palette so night doesn't change shapes). */
+    int *green = calloc(object_count, sizeof(int)), *total = calloc(object_count, sizeof(int));
+    for (int my = 0; my < EBW_MINI_H; my++)
+        for (int mx = 0; mx < EBW_MINI_W; mx++) {
+            int id = object_of[my * EBW_MINI_W + mx];
+            if (id < 0 || objects[id].indoors || objects[id].is_prop) continue;
+            for (int k = 0; k < 4; k++) {
+                uint32_t c = pixel_at(mx * 8 + 2 + (k & 1) * 4, my * 8 + 2 + (k >> 1) * 4, false);
+                int r = c & 0xFF, g = (c >> 8) & 0xFF, b = (c >> 16) & 0xFF;
+                total[id]++;
+                if (g > r + 16 && g >= b) green[id]++;
+            }
+        }
+    for (int i = 0; i < object_count; i++) {
+        Object *o = &objects[i];
+        int w = o->x1 - o->x0 + 1, h = o->y1 - o->y0 + 1;
+        /* Thin outdoor things (fences, railings) are cut out column by column like foliage, so
+         * the gaps between pickets show through. */
+        bool thin = !o->indoors && !o->is_prop && (w <= 2 || h <= 2);
+        o->foliage = thin || (total[i] && green[i] * 2 >= total[i]);
+        /* Buildings are compact blocks; cliffs sprawl along diagonals and leave their box mostly empty. */
+        float fill = (float)o->cells / (float)(w * h);
+        o->terrain = !o->indoors && !o->is_prop && !o->foliage && (w > 48 || h > 48 || (w * h > 200 && fill < 0.5f));
+        if (o->terrain) o->levels = TERRAIN_LEVELS;
+    }
+    free(green);
+    free(total);
+    free(stack);
+    analysed = true;
+}
+
+/* Small things (trees, bushes, signs, posts) become cut-out sprites; the rest are solid. */
+static bool looks_like_prop(const Object *o)
+{
+    int w = o->x1 - o->x0 + 1, h = o->y1 - o->y0 + 1;
+    return w <= 6 && h <= 6 && o->cells <= 30 && !o->indoors;
+}
+
+/* ---- props: small objects as camera-facing cut-outs ---- */
+
+#define PROP_ATLAS 2048
+
+typedef struct {
+    float x, z, w, h;
+    Rectangle src; /* in the prop atlas */
+} Prop;
+
+static Texture2D prop_atlas;
+static int shelf_x, shelf_y, shelf_h;
+
+/* Pixels erased from the floor where a prop used to be painted; per map tile, 0 = unchanged. */
+static uint32_t **floor_patch[2];
+
+static bool pack_prop(int w, int h, Rectangle *out)
+{
+    if (shelf_x + w > PROP_ATLAS) {
+        shelf_x = 0;
+        shelf_y += shelf_h;
+        shelf_h = 0;
+    }
+    if (shelf_y + h > PROP_ATLAS || w > PROP_ATLAS) {
+        atlas_full = true;
+        return false;
+    }
+    *out = (Rectangle){(float)shelf_x, (float)shelf_y, (float)w, (float)h};
+    shelf_x += w + 1;
+    if (h + 1 > shelf_h) shelf_h = h + 1;
+    return true;
+}
+
+static void patch_floor(int px, int py, uint32_t colour, bool event)
+{
+    int t = (py >> 5) * EBW_MAP_W + (px >> 5);
+    uint32_t **patches = floor_patch[event ? 1 : 0];
+    if (!patches[t]) patches[t] = calloc(32 * 32, sizeof(uint32_t));
+    patches[t][(py & 31) * 32 + (px & 31)] = colour;
+}
+
+/* The ground colours around a spot: the two most common colours in the open cells just below
+ * and beside it. Those pixels become transparent in cut-outs. */
+static bool ground_keys(int x0, int x1, int ybase, bool event, uint32_t *key1, uint32_t *key2)
+{
+    uint32_t colours[16];
+    int counts[16], ncol = 0;
+    for (int my = ybase - 1; my <= ybase + 2; my++)
+        for (int mx = x0 - 1; mx <= x1 + 1; mx++) {
+            if (solid(mx, my)) continue;
+            for (int i = 0; i < 64; i++) {
+                uint32_t c = pixel_at(mx * 8 + (i & 7), my * 8 + (i >> 3), event);
+                int k = 0;
+                while (k < ncol && colours[k] != c) k++;
+                if (k == ncol) {
+                    if (ncol == 16) continue;
+                    colours[ncol] = c;
+                    counts[ncol++] = 0;
+                }
+                counts[k]++;
+            }
+        }
+    if (ncol == 0) return false;
+    int best = 0, second = -1;
+    for (int k = 1; k < ncol; k++)
+        if (counts[k] > counts[best]) best = k;
+    for (int k = 0; k < ncol; k++)
+        if (k != best && (second < 0 || counts[k] > counts[second])) second = k;
+    *key1 = colours[best];
+    *key2 = (second >= 0 && counts[second] * 4 >= counts[best]) ? colours[second] : *key1;
+    return true;
+}
+
+/* Cuts an object's art out of a pixel window of the map: its own pixels plus everything drawn
+ * connected to them (a tree's canopy), minus the ground colours. The cut-out pixels are erased
+ * from the floor. The sprite stands at depth z. False if nothing could be cut. */
+static bool cut_out(int id, int wx0, int wy0, int ww, int wh, uint32_t key1, uint32_t key2, bool event, float z,
+                    Prop *out)
+{
+    enum { MAXW = 96, MAXH = 128 };
+    if (ww > MAXW || wh > MAXH || ww <= 0 || wh <= 0) return false;
+    static uint32_t win[MAXW * MAXH];
+    static uint8_t mask[MAXW * MAXH];
+    static int queue[MAXW * MAXH];
+    int qn = 0;
+    for (int y = 0; y < wh; y++)
+        for (int x = 0; x < ww; x++) {
+            int px = wx0 + x, py = wy0 + y;
+            uint32_t c = pixel_at(px, py, event);
+            win[y * ww + x] = c;
+            int obj = (px >= 0 && py >= 0) ? object_at(px >> 3, py >> 3) : -2;
+            bool allowed = (obj == id || obj == -1) && c != key1 && c != key2;
+            mask[y * ww + x] = allowed ? 1 : 0;
+            if (allowed && obj == id) {
+                mask[y * ww + x] = 2;
+                queue[qn++] = y * ww + x;
+            }
+        }
+    for (int qi = 0; qi < qn; qi++) {
+        int p = queue[qi], x = p % ww, y = p / ww;
+        const int nb[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (int k = 0; k < 4; k++) {
+            int nx = x + nb[k][0], ny = y + nb[k][1];
+            if (nx < 0 || ny < 0 || nx >= ww || ny >= wh) continue;
+            int np = ny * ww + nx;
+            if (mask[np] == 1) {
+                mask[np] = 2;
+                queue[qn++] = np;
+            }
+        }
+    }
+    int bx0 = ww, by0 = wh, bx1 = -1, by1 = -1;
+    for (int y = 0; y < wh; y++)
+        for (int x = 0; x < ww; x++)
+            if (mask[y * ww + x] == 2) {
+                if (x < bx0) bx0 = x;
+                if (x > bx1) bx1 = x;
+                if (y < by0) by0 = y;
+                if (y > by1) by1 = y;
+            }
+    if (bx1 < 0) return false;
+    by1 = wh - 1; /* keep the sprite's feet on the ground line */
+    int bw = bx1 - bx0 + 1, bh = by1 - by0 + 1;
+    Rectangle r;
+    if (!pack_prop(bw, bh, &r)) return false;
+
+    static uint32_t img[MAXW * MAXH];
+    for (int y = 0; y < bh; y++)
+        for (int x = 0; x < bw; x++) {
+            int wi = (by0 + y) * ww + bx0 + x;
+            bool in = mask[wi] == 2;
+            img[y * bw + x] = in ? win[wi] : 0;
+            if (in) patch_floor(wx0 + bx0 + x, wy0 + by0 + y, key1, event);
+        }
+    UpdateTextureRec(prop_atlas, r, img);
+
+    out->src = r;
+    out->w = bw / 8.0f;
+    out->h = bh / 8.0f;
+    out->x = (wx0 + bx0 + bw * 0.5f) / 8.0f;
+    out->z = z;
+    return true;
+}
+
+static bool make_prop(Object *o, bool event, Prop *out)
+{
+    uint32_t k1, k2;
+    if (!ground_keys(o->x0, o->x1, o->y1, event, &k1, &k2)) return false;
+    int id = (int)(o - objects);
+    return cut_out(id, (o->x0 - 2) * 8, (o->y0 - 8) * 8, (o->x1 - o->x0 + 5) * 8, (o->y1 - o->y0 + 9) * 8, k1, k2,
+                   event, (o->y0 + o->y1 + 1) * 0.5f, out);
+}
+
+/* One column of a tree cluster: the run of solid cells ending at `base`, plus canopy above. */
+static bool make_strip(int id, int mx, int base, bool event, Prop *out)
+{
+    uint32_t k1, k2;
+    if (!ground_keys(mx, mx, base, event, &k1, &k2)) return false;
+    int top = base;
+    while (top > base - 9 && object_at(mx, top - 1) == id) top--;
+    top -= 6; /* canopy drawn above the solid part */
+    return cut_out(id, mx * 8, top * 8, 8, (base - top + 1) * 8, k1, k2, event, base + 0.5f, out);
+}
+
+/* ---- per-sector chunks ---- */
+
+#define CHUNK_MW (EBW_SECTOR_W * 4) /* minitiles */
+#define CHUNK_MH (EBW_SECTOR_H * 4)
+
+typedef struct {
+    bool built, has_mesh, props_done;
+    Mesh mesh;
+    Prop *props;
+    int nprops;
+    int last_used;
+} Chunk;
+
+static Chunk chunks[EBW_SECTORS_Y][EBW_SECTORS_X];
+static int frame_no;
+
+/* Cuts out the props whose base lies in this chunk. Their canopies can reach into the chunk to
+ * the north, so a chunk's floor is built only after its southern neighbours have run this. */
+static void ensure_props(int sx, int sy, bool event)
+{
+    if (sx < 0 || sy < 0 || sx >= EBW_SECTORS_X || sy >= EBW_SECTORS_Y) return;
+    Chunk *c = &chunks[sy][sx];
+    if (c->props_done) return;
+    c->props_done = true;
+    for (int my = sy * CHUNK_MH; my < (sy + 1) * CHUNK_MH; my++)
+        for (int mx = sx * CHUNK_MW; mx < (sx + 1) * CHUNK_MW; mx++) {
+            int id = object_at(mx, my);
+            if (id < 0) continue;
+            Object *o = &objects[id];
+            Prop p;
+            if (o->foliage && !o->is_prop) {
+                /* Each column of a grove stands up as its own strip at the bottom of its run. */
+                if (object_at(mx, my + 1) == id || !make_strip(id, mx, my, event, &p)) continue;
+            } else {
+                /* The first chunk to reach the object's bottom row cuts it out. */
+                if (!o->is_prop || o->prop_made || my != o->y1) continue;
+                o->prop_made = true;
+                if (!make_prop(o, event, &p)) {
+                    o->is_prop = false; /* fall back to a solid block */
+                    continue;
+                }
+            }
+            c->props = realloc(c->props, sizeof(Prop) * (c->nprops + 1));
+            c->props[c->nprops++] = p;
+        }
+}
 
 typedef struct {
     float *pos, *uv;
@@ -110,7 +495,7 @@ typedef struct {
 
 static void mb_quad(MeshBuf *m, Vector3 a, Vector3 b, Vector3 c, Vector3 d, UvRect uv, unsigned char shade)
 {
-    /* a-b-c-d counter-clockwise seen from the front; uv: a=(u0,v0) b=(u1,v0) c=(u1,v1) d=(u0,v1) */
+    /* uv: a=(u0,v0) b=(u1,v0) c=(u1,v1) d=(u0,v1) */
     if (m->verts + 4 > 65535) return;
     if (m->verts + 4 > m->cap_v) {
         m->cap_v = m->cap_v ? m->cap_v * 2 : 1024;
@@ -142,135 +527,90 @@ static void mb_quad(MeshBuf *m, Vector3 a, Vector3 b, Vector3 c, Vector3 d, UvRe
     m->tris += 2;
 }
 
-/* ---- per-sector chunks ---- */
-
-#define CHUNK_MW (EBW_SECTOR_W * 4) /* minitiles */
-#define CHUNK_MH (EBW_SECTOR_H * 4)
-#define MAX_RUN 64
-
-typedef struct {
-    bool built, has_mesh;
-    Mesh mesh;
-    int last_used;
-} Chunk;
-
-static Chunk chunks[EBW_SECTORS_Y][EBW_SECTORS_X];
-static Shader shader;
-static Material material;
-static int frame_no;
-static int loc_cam, loc_fog_color, loc_fog_start, loc_fog_end, loc_tint;
-
-static bool solid(int mx, int my) { return (ebw_collision_at(mx, my) & EBW_SOLID) != 0; }
-
-static UvRect minitile_uv_at(int mx, int my, bool event)
+static int floor_slot(int tx, int ty, bool event)
 {
-    int tx = mx >> 2, ty = my >> 2;
-    int slot = atlas_slot(ebw_tileset_at(tx, ty), ebw_palette_at(tx, ty), event, ebw_tile_at(tx, ty));
-    return minitile_uv(slot, (my & 3) * 4 + (mx & 3));
+    uint32_t *patch = floor_patch[event ? 1 : 0][ty * EBW_MAP_W + tx];
+    if (!patch) return atlas_slot(tx, ty, event);
+    int32_t *cached = &slot_of_cleaned[(event ? MAP_TILES : 0) + ty * EBW_MAP_W + tx];
+    if (*cached < 0) {
+        uint32_t px[32 * 32];
+        memcpy(px, tile_pixels(tx, ty, event), sizeof px);
+        for (int i = 0; i < 32 * 32; i++)
+            if (patch[i]) px[i] = patch[i];
+        *cached = new_slot(px);
+    }
+    return *cached;
 }
 
-/* Vertical solid run containing (mx, my): first and last row. */
-static void column_run(int mx, int my, int *y0, int *y1)
+/* Bottom row of the object's column through (mx, my): where its front wall stands. */
+static int column_base(int mx, int my, int id)
 {
-    int a = my, b = my;
-    while (a > my - MAX_RUN && solid(mx, a - 1)) a--;
-    while (b < my + MAX_RUN && solid(mx, b + 1)) b++;
-    *y0 = a;
-    *y1 = b;
+    while (object_at(mx, my + 1) == id) my++;
+    return my;
 }
-
-/* In facade mode, a run's height in levels: its depth in minitiles, capped. */
-static int facade_levels(int y0, int y1, int cap) { int n = y1 - y0 + 1; return n < cap ? n : cap; }
 
 static void build_chunk(int sx, int sy, const W3dOptions *opt)
 {
-    MeshBuf m = {0};
     bool event = opt->value[OPT_PALETTE] == 1;
-    float s = wall_scale(opt);
     bool facades = opt->value[OPT_WALL_STYLE] == 0;
-    const int cap = 12; /* facade levels; deeper runs get a flat roof over the rest */
+    for (int dy = 0; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) ensure_props(sx + dx, sy + dy, event);
 
-    /* Floor: one quad per map tile. */
+    MeshBuf m = {0};
     for (int ty = sy * EBW_SECTOR_H; ty < (sy + 1) * EBW_SECTOR_H; ty++)
         for (int tx = sx * EBW_SECTOR_W; tx < (sx + 1) * EBW_SECTOR_W; tx++) {
-            int slot = atlas_slot(ebw_tileset_at(tx, ty), ebw_palette_at(tx, ty), event, ebw_tile_at(tx, ty));
             float x0 = tx * 4.0f, z0 = ty * 4.0f;
             mb_quad(&m, (Vector3){x0, 0, z0}, (Vector3){x0 + 4, 0, z0}, (Vector3){x0 + 4, 0, z0 + 4},
-                    (Vector3){x0, 0, z0 + 4}, maptile_uv(slot), 255);
+                    (Vector3){x0, 0, z0 + 4}, slot_uv(floor_slot(tx, ty, event), 0, 0, 32, 32), 255);
         }
 
-    int mx0 = sx * CHUNK_MW, my0 = sy * CHUNK_MH;
-    for (int my = my0; my < my0 + CHUNK_MH; my++)
-        for (int mx = mx0; mx < mx0 + CHUNK_MW; mx++) {
-            if (!solid(mx, my)) continue;
+    for (int my = sy * CHUNK_MH; my < (sy + 1) * CHUNK_MH; my++)
+        for (int mx = sx * CHUNK_MW; mx < (sx + 1) * CHUNK_MW; mx++) {
+            int id = object_at(mx, my);
+            if (id < 0 || objects[id].is_prop || objects[id].foliage) continue;
+            Object *o = &objects[id];
             float x = (float)mx, z = (float)my;
-
-            if (!facades) {
-                /* Blocks: every solid minitile is a box wearing its own art. */
-                float h = 2.0f * s;
-                UvRect uv = minitile_uv_at(mx, my, event);
-                mb_quad(&m, (Vector3){x, h, z}, (Vector3){x + 1, h, z}, (Vector3){x + 1, h, z + 1},
-                        (Vector3){x, h, z + 1}, uv, 255);
-                int levels = (int)ceilf(h);
-                for (int k = 0; k < levels; k++) {
-                    float ya = h * k / levels, yb = h * (k + 1) / levels;
-                    if (!solid(mx, my + 1))
-                        mb_quad(&m, (Vector3){x, yb, z + 1}, (Vector3){x + 1, yb, z + 1},
-                                (Vector3){x + 1, ya, z + 1}, (Vector3){x, ya, z + 1}, uv, 225);
-                    if (!solid(mx, my - 1))
-                        mb_quad(&m, (Vector3){x + 1, yb, z}, (Vector3){x, yb, z}, (Vector3){x, ya, z},
-                                (Vector3){x + 1, ya, z}, uv, 150);
-                    if (!solid(mx + 1, my))
-                        mb_quad(&m, (Vector3){x + 1, yb, z + 1}, (Vector3){x + 1, yb, z},
-                                (Vector3){x + 1, ya, z}, (Vector3){x + 1, ya, z + 1}, uv, 190);
-                    if (!solid(mx - 1, my))
-                        mb_quad(&m, (Vector3){x, yb, z}, (Vector3){x, yb, z + 1}, (Vector3){x, ya, z + 1},
-                                (Vector3){x, ya, z}, uv, 190);
-                }
-                continue;
-            }
-
-            /* Facades: a column of solid minitiles stands up so the art drawn "above" a building's
-             * base becomes its front wall, the way the original perspective implies. */
-            int y0, y1;
-            column_run(mx, my, &y0, &y1);
-            int levels = facade_levels(y0, y1, cap);
+            float s = o->indoors ? INDOOR_SCALE : OUTDOOR_SCALE;
+            int levels = facades ? o->levels : 2;
             float h = levels * s;
+            bool open_s = object_at(mx, my + 1) != id, open_n = object_at(mx, my - 1) != id;
+            bool open_e = object_at(mx + 1, my) != id, open_w = object_at(mx - 1, my) != id;
 
-            /* Roof over this minitile. */
             mb_quad(&m, (Vector3){x, h, z}, (Vector3){x + 1, h, z}, (Vector3){x + 1, h, z + 1},
-                    (Vector3){x, h, z + 1}, minitile_uv_at(mx, my, event), 235);
+                    (Vector3){x, h, z + 1}, minitile_uv(mx, my, event), 235);
+            if (!(open_s || open_n || open_e || open_w)) continue;
 
-            /* Height of the neighbouring columns, to know how much side wall shows above them. */
-            float side_h[2] = {0, 0};
+            /* Every face of the object wears its front art: level k shows the row k above the
+             * base of this column, so a building's walls continue its facade all the way round. */
+            int base = facades ? column_base(mx, my, id) : my;
+            /* Side walls borrow the siding from two columns in, not the roof's edge. */
+            int side_col[2] = {mx, mx};
             for (int i = 0; i < 2; i++) {
-                int nx = mx + (i ? 1 : -1);
-                if (solid(nx, my)) {
-                    int a, b;
-                    column_run(nx, my, &a, &b);
-                    side_h[i] = facade_levels(a, b, cap) * s;
-                }
+                int dir = i ? -1 : 1; /* east face looks inward to the west, and vice versa */
+                for (int step = 2; step >= 1; step--)
+                    if (object_at(mx + dir * step, my) == id) {
+                        side_col[i] = mx + dir * step;
+                        break;
+                    }
             }
-
-            /* The level-k slice of this column's wall shows minitile row (y1 - k). */
+            int side_base[2] = {column_base(side_col[0], my, id), column_base(side_col[1], my, id)};
             for (int k = 0; k < levels; k++) {
-                UvRect uv = minitile_uv_at(mx, y1 - k, event);
+                UvRect uv = minitile_uv(mx, facades ? base - k : my, event);
+                UvRect uv_e = facades ? minitile_uv(side_col[1], side_base[1] - k, event) : uv;
+                UvRect uv_w = facades ? minitile_uv(side_col[0], side_base[0] - k, event) : uv;
                 float ya = k * s, yb = (k + 1) * s;
-                if (my == y1)
+                if (open_s)
                     mb_quad(&m, (Vector3){x, yb, z + 1}, (Vector3){x + 1, yb, z + 1}, (Vector3){x + 1, ya, z + 1},
                             (Vector3){x, ya, z + 1}, uv, 225);
-                if (my == y0)
+                if (open_n)
                     mb_quad(&m, (Vector3){x + 1, yb, z}, (Vector3){x, yb, z}, (Vector3){x, ya, z},
-                            (Vector3){x + 1, ya, z}, uv, 140);
-                for (int side = -1; side <= 1; side += 2) {
-                    float nh = side_h[side > 0];
-                    if (nh >= yb) continue;
-                    float lo = ya > nh ? ya : nh;
-                    float ex = side > 0 ? x + 1 : x;
-                    float za = side > 0 ? z + 1 : z, zb = side > 0 ? z : z + 1;
-                    mb_quad(&m, (Vector3){ex, yb, za}, (Vector3){ex, yb, zb}, (Vector3){ex, lo, zb},
-                            (Vector3){ex, lo, za}, uv, 185);
-                }
+                            (Vector3){x + 1, ya, z}, uv, 150);
+                if (open_e)
+                    mb_quad(&m, (Vector3){x + 1, yb, z + 1}, (Vector3){x + 1, yb, z}, (Vector3){x + 1, ya, z},
+                            (Vector3){x + 1, ya, z + 1}, uv_e, 190);
+                if (open_w)
+                    mb_quad(&m, (Vector3){x, yb, z}, (Vector3){x, yb, z + 1}, (Vector3){x, ya, z + 1},
+                            (Vector3){x, ya, z}, uv_w, 190);
             }
         }
 
@@ -288,27 +628,46 @@ static void build_chunk(int sx, int sy, const W3dOptions *opt)
         mesh.indices = m.idx;
         UploadMesh(&mesh, false);
         c->mesh = mesh;
-    } else {
-        RL_FREE(m.pos);
-        RL_FREE(m.uv);
-        RL_FREE(m.col);
-        RL_FREE(m.idx);
     }
 }
 
-static void free_chunk(Chunk *c)
+static void free_chunk_mesh(Chunk *c)
 {
     if (c->has_mesh) UnloadMesh(c->mesh);
-    memset(c, 0, sizeof *c);
+    c->has_mesh = c->built = false;
 }
 
+/* Throws everything away: geometry, props, and both atlases. */
 void w3d_invalidate(void)
 {
     for (int y = 0; y < EBW_SECTORS_Y; y++)
-        for (int x = 0; x < EBW_SECTORS_X; x++) free_chunk(&chunks[y][x]);
+        for (int x = 0; x < EBW_SECTORS_X; x++) {
+            Chunk *c = &chunks[y][x];
+            free_chunk_mesh(c);
+            free(c->props);
+            memset(c, 0, sizeof *c);
+        }
+    for (int e = 0; e < 2; e++)
+        if (floor_patch[e])
+            for (int t = 0; t < MAP_TILES; t++) {
+                free(floor_patch[e][t]);
+                floor_patch[e][t] = NULL;
+            }
+    if (slot_of_key) {
+        memset(slot_of_key, 0xFF, sizeof(int32_t) * KEY_COUNT);
+        memset(slot_of_cleaned, 0xFF, sizeof(int32_t) * MAP_TILES * 2);
+    }
+    slots_used = 0;
+    shelf_x = shelf_y = shelf_h = 0;
+    atlas_full = false;
+    if (analysed)
+        for (int i = 0; i < object_count; i++) {
+            objects[i].prop_made = false;
+            objects[i].is_prop = looks_like_prop(&objects[i]);
+        }
 }
 
-/* ---- shader: fog and colour mood ---- */
+/* ---- shader: fog, colour mood, and cut-out transparency ---- */
 
 static const char *vs_src =
     "#version 330\n"
@@ -328,10 +687,16 @@ static const char *fs_src =
     "uniform vec3 camPos; uniform vec3 fogColor; uniform float fogStart; uniform float fogEnd; uniform vec3 tint;\n"
     "out vec4 finalColor;\n"
     "void main() {\n"
-    "  vec3 c = texture(texture0, uv).rgb * col.rgb * tint;\n"
+    "  vec4 t = texture(texture0, uv);\n"
+    "  if (t.a < 0.5) discard;\n"
+    "  vec3 c = t.rgb * col.rgb * tint;\n"
     "  float f = clamp((length(wpos - camPos) - fogStart) / (fogEnd - fogStart), 0.0, 1.0);\n"
     "  finalColor = vec4(mix(c, fogColor, f), 1.0);\n"
     "}\n";
+
+static Shader shader;
+static Material material;
+static int loc_cam, loc_fog_color, loc_fog_start, loc_fog_end, loc_tint, loc_model;
 
 typedef struct {
     Vector3 fog, tint;
@@ -360,12 +725,21 @@ void w3d_init(void)
     atlas = LoadTextureFromImage(blank);
     UnloadImage(blank);
     SetTextureFilter(atlas, TEXTURE_FILTER_POINT);
+    blank = GenImageColor(PROP_ATLAS, PROP_ATLAS, BLANK);
+    prop_atlas = LoadTextureFromImage(blank);
+    UnloadImage(blank);
+    SetTextureFilter(prop_atlas, TEXTURE_FILTER_POINT);
+
     slot_of_key = malloc(sizeof(int32_t) * KEY_COUNT);
-    memset(slot_of_key, 0xFF, sizeof(int32_t) * KEY_COUNT);
-    slots_used = 0;
+    slot_of_cleaned = malloc(sizeof(int32_t) * MAP_TILES * 2);
+    for (int e = 0; e < 2; e++) floor_patch[e] = calloc(MAP_TILES, sizeof(uint32_t *));
+    tile_cache = malloc(sizeof(*tile_cache) * TILE_CACHE);
+    for (int i = 0; i < TILE_CACHE; i++) tile_cache[i].key = -1;
+    w3d_invalidate();
 
     shader = LoadShaderFromMemory(vs_src, fs_src);
-    shader.locs[SHADER_LOC_MATRIX_MODEL] = GetShaderLocation(shader, "matModel");
+    loc_model = GetShaderLocation(shader, "matModel");
+    shader.locs[SHADER_LOC_MATRIX_MODEL] = loc_model;
     loc_cam = GetShaderLocation(shader, "camPos");
     loc_fog_color = GetShaderLocation(shader, "fogColor");
     loc_fog_start = GetShaderLocation(shader, "fogStart");
@@ -385,21 +759,82 @@ void w3d_shutdown(void)
     UnloadMaterial(material);
     UnloadShader(shader);
     UnloadTexture(atlas);
+    UnloadTexture(prop_atlas);
     free(slot_of_key);
-    slot_of_key = NULL;
+    free(slot_of_cleaned);
+    for (int e = 0; e < 2; e++) free(floor_patch[e]);
+    free(tile_cache);
+    free(solid_grid);
+    free(object_of);
+    free(objects);
+    slot_of_key = slot_of_cleaned = NULL;
+    floor_patch[0] = floor_patch[1] = NULL;
+    analysed = false;
 }
 
-bool w3d_is_solid(float x, float z) { return solid((int)floorf(x), (int)floorf(z)); }
+void w3d_class_map(const char *path, int tx, int ty, int tw, int th)
+{
+    if (!analysed) analyse_world();
+    int w = tw * 32, h = th * 32;
+    Image img = GenImageColor(w, h, BLACK);
+    uint32_t *out = img.data;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            int px = tx * 32 + x, py = ty * 32 + y;
+            uint32_t c = pixel_at(px, py, false);
+            int id = object_at(px / 8, py / 8);
+            uint32_t tint = 0;
+            if (id >= 0) {
+                Object *o = &objects[id];
+                tint = o->is_prop ? 0xFF00FFFF : o->foliage ? 0xFFFFFF00 : o->terrain ? 0xFFFF0000 : 0xFF0000FF;
+            }
+            if (tint) { /* blend 50% */
+                uint32_t r = ((c & 0xFF) + (tint & 0xFF)) / 2, g = (((c >> 8) & 0xFF) + ((tint >> 8) & 0xFF)) / 2,
+                         b = (((c >> 16) & 0xFF) + ((tint >> 16) & 0xFF)) / 2;
+                c = r | g << 8 | b << 16 | 0xFF000000u;
+            }
+            out[y * w + x] = c;
+        }
+    ExportImage(img, path);
+    UnloadImage(img);
+}
+
+void w3d_probe(int px, int py)
+{
+    if (!analysed) analyse_world();
+    int id = object_at(px / 8, py / 8);
+    if (id < 0) {
+        TraceLog(LOG_WARNING, "probe %d,%d: open ground", px, py);
+        return;
+    }
+    Object *o = &objects[id];
+    TraceLog(LOG_WARNING, "probe %d,%d: object %d box %d,%d-%d,%d cells %d levels %d prop %d foliage %d terrain %d indoors %d",
+             px, py, id, o->x0, o->y0, o->x1, o->y1, o->cells, o->levels, o->is_prop, o->foliage, o->terrain, o->indoors);
+}
+
+bool w3d_is_solid(float x, float z) { return analysed && solid((int)floorf(x), (int)floorf(z)); }
+
+static void draw_props(const Chunk *c, Vector3 right)
+{
+    for (int i = 0; i < c->nprops; i++) {
+        const Prop *p = &c->props[i];
+        float u0 = p->src.x / PROP_ATLAS, v0 = p->src.y / PROP_ATLAS;
+        float u1 = (p->src.x + p->src.width) / PROP_ATLAS, v1 = (p->src.y + p->src.height) / PROP_ATLAS;
+        float hw = p->w * 0.5f * OUTDOOR_SCALE, h = p->h * OUTDOOR_SCALE;
+        Vector3 l = {p->x - right.x * hw, 0, p->z - right.z * hw}, r = {p->x + right.x * hw, 0, p->z + right.z * hw};
+        rlTexCoord2f(u0, v1); rlVertex3f(l.x, 0, l.z);
+        rlTexCoord2f(u1, v1); rlVertex3f(r.x, 0, r.z);
+        rlTexCoord2f(u1, v0); rlVertex3f(r.x, h, r.z);
+        rlTexCoord2f(u0, v0); rlVertex3f(l.x, h, l.z);
+    }
+}
 
 void w3d_draw(Camera3D cam, const W3dOptions *opt)
 {
+    if (!analysed) analyse_world();
     frame_no++;
-    if (atlas_full) {
-        w3d_invalidate();
-        memset(slot_of_key, 0xFF, sizeof(int32_t) * KEY_COUNT);
-        slots_used = 0;
-        atlas_full = false;
-    }
+    if (atlas_full) w3d_invalidate();
+
     Mood mood = mood_for(opt->value[OPT_MOOD]);
     float fog_end = fog_end_for(opt->value[OPT_FOG]);
     float fog_start = fog_end * 0.35f;
@@ -412,13 +847,16 @@ void w3d_draw(Camera3D cam, const W3dOptions *opt)
     ClearBackground((Color){(unsigned char)(mood.fog.x * 255), (unsigned char)(mood.fog.y * 255),
                             (unsigned char)(mood.fog.z * 255), 255});
     BeginMode3D(cam);
-    rlDisableBackfaceCulling(); /* walls are seen from both sides */
+    rlDisableBackfaceCulling(); /* walls and cut-outs are seen from both sides */
 
     float reach = fog_end + 16;
     Vector3 fwd = Vector3Normalize(Vector3Subtract(cam.target, cam.position));
+    Vector3 right = Vector3Normalize((Vector3){-fwd.z, 0, fwd.x});
     int csx = (int)floorf(cam.position.x / CHUNK_MW), csy = (int)floorf(cam.position.z / CHUNK_MH);
     int rx = (int)(reach / CHUNK_MW) + 1, ry = (int)(reach / CHUNK_MH) + 1;
     int builds_left = 6; /* spread chunk building over frames */
+    static Chunk *visible[EBW_SECTORS_X * EBW_SECTORS_Y];
+    int nvisible = 0;
 
     for (int pass = 0; pass < 2; pass++) /* pass 0 builds nearest chunks first */
         for (int ring = 0; ring <= (rx > ry ? rx : ry); ring++)
@@ -432,7 +870,6 @@ void w3d_draw(Camera3D cam, const W3dOptions *opt)
                     to.y = 0;
                     float dist = Vector3Length(to);
                     if (dist > reach + CHUNK_MW) continue;
-                    /* Skip chunks well behind the camera. */
                     if (dist > CHUNK_MW && Vector3DotProduct(to, fwd) < -0.3f * dist) continue;
                     Chunk *c = &chunks[sy][sx];
                     if (pass == 0) {
@@ -444,12 +881,27 @@ void w3d_draw(Camera3D cam, const W3dOptions *opt)
                     }
                     if (c->has_mesh) DrawMesh(c->mesh, material, MatrixIdentity());
                     c->last_used = frame_no;
+                    if (c->built) visible[nvisible++] = c;
                 }
+
+    /* Cut-outs turn to face the camera, like sprites in Doom. */
+    rlDrawRenderBatchActive();
+    BeginShaderMode(shader);
+    Matrix identity = MatrixIdentity();
+    SetShaderValueMatrix(shader, loc_model, identity);
+    rlSetTexture(prop_atlas.id);
+    rlBegin(RL_QUADS);
+    rlColor4ub(255, 255, 255, 255);
+    for (int i = 0; i < nvisible; i++) draw_props(visible[i], right);
+    rlEnd();
+    rlSetTexture(0);
+    EndShaderMode();
+
     rlEnableBackfaceCulling();
     EndMode3D();
 
-    /* Free chunks not drawn for a while so memory stays bounded. */
+    /* Drop meshes not drawn for a while so GPU memory stays bounded; props stay cut out. */
     for (int y = 0; y < EBW_SECTORS_Y; y++)
         for (int x = 0; x < EBW_SECTORS_X; x++)
-            if (chunks[y][x].built && frame_no - chunks[y][x].last_used > 600) free_chunk(&chunks[y][x]);
+            if (chunks[y][x].built && frame_no - chunks[y][x].last_used > 600) free_chunk_mesh(&chunks[y][x]);
 }

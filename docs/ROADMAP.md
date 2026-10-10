@@ -19,7 +19,15 @@ Major creative choices ship as **switchable options inside the build** (D20). Th
 - ✅ ROM decoder (`src/eb_world.c`): map, sectors, 20 tilesets, palettes (including story-event variants), and collision, decoded at startup from the user's ROM. HAL decompression is implemented. `ebmapdump` renders any area top-down for checking.
 - ✅ 3D builder (`src/world3d.c`): floor from map tiles; walls from solid collision, in two styles: **Facades** (each solid column stands up so the oblique art becomes the front wall) and **Blocks** (diorama). Texture atlas filled on demand, built per sector with fog distance culling.
 - ✅ Free-fly viewer (`src/viewer.c`), opened with V. Six switchable options (D20): resolution, wall style, wall height, fog, mood, palette.
-- 🟡 **User:** fly around Onett and pick a value for each option. Note anything that looks wrong (trees, cliffs, fences, roofs).
+- ✅ 🟡 User picks: 640x360, Facades, Light fog (D21). Wall height follows context (D23); mood and palette follow context (D24).
+- ✅ "Rounded out" pass (D22). Solid areas are grouped into objects and drawn by kind:
+  - **Props** (small trees, bushes, signs, posts) become camera-facing cut-out sprites keyed against the ground colour, and the copy painted on the floor is erased.
+  - **Foliage and thin things** (groves, hedges, fences) become one cut-out strip per column.
+  - **Buildings** get one uniform height in whole storeys, and their side walls borrow the siding art.
+  - **Terrain** (cliffs) is kept as low ledges.
+  - Debug flags: `--probe px py` and `--class-map file tx ty tw th`.
+- 🟡 **User:** fly around again and point out the worst remaining spots.
+- Known leftovers: tree rows that touch a cliff merge into it and render as ledge; staircase edges on diagonal cliff lips; close-up hedge strips look flat; terrain has no real elevation (plateaus aren't raised).
 
 ## Phase 2 — Seeing through Ness's eyes (2–3 sessions)
 - The camera sits at Ness's real position. Free movement and turning (D7): mouse or right stick turns, and movement is fed to the game so its own collision, doors, and triggers still fire.

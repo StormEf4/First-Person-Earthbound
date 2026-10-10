@@ -30,6 +30,7 @@ void ebw_free(void);
 /* Sector properties for a map-tile coordinate. */
 int ebw_tileset_at(int tx, int ty); /* map tileset 0-31 */
 int ebw_palette_at(int tx, int ty);
+bool ebw_indoors_at(int tx, int ty); /* sector "setting" says indoors */
 
 uint16_t ebw_tile_at(int tx, int ty); /* arrangement index 0-1023 */
 uint8_t ebw_collision_at(int mx, int my); /* minitile coordinates */

@@ -5,7 +5,9 @@
 #include "raylib.h"
 
 /* Creative options the user flips between while playing (D20). Each cycles with a number key. */
-typedef enum { OPT_RESOLUTION, OPT_WALL_STYLE, OPT_WALL_HEIGHT, OPT_FOG, OPT_MOOD, OPT_PALETTE, OPT_COUNT } OptionId;
+/* Wall height isn't an option: it follows context (D23), low indoors and tall outdoors. Mood and
+ * palette will follow context too (D24); until then these keys are manual overrides. */
+typedef enum { OPT_RESOLUTION, OPT_WALL_STYLE, OPT_FOG, OPT_MOOD, OPT_PALETTE, OPT_COUNT } OptionId;
 
 typedef struct {
     int value[OPT_COUNT];
@@ -28,5 +30,11 @@ void w3d_draw(Camera3D cam, const W3dOptions *opt);
 /* Throws away built geometry, e.g. after a wall option changes. */
 void w3d_invalidate(void);
 
-/* Height of solid geometry under a world position (0 when open ground), for the fly camera. */
+/* True if the minitile under a world position is solid in the game's collision data. */
 bool w3d_is_solid(float x, float z);
+
+/* Debug: logs the object under a map pixel. */
+void w3d_probe(int px, int py);
+/* Debug: writes a top-down PNG with objects tinted by class (yellow prop, cyan foliage, blue
+ * terrain, red building). */
+void w3d_class_map(const char *path, int tx, int ty, int tw, int th);

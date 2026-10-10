@@ -330,6 +330,9 @@ int main(int argc, char **argv)
     bool allow_any_rom = false, force_debug = false, view3d = false;
     float cam[4] = {-1, -1, 0, 0}; /* --cam px py yaw pitch */
     float cam_y = -1;                /* --cam-y units */
+    int probe[16][2], nprobe = 0;    /* --probe px py: log the object there */
+    const char *class_map = NULL;    /* --class-map file tx ty tw th */
+    int class_rect[4] = {0};
 
     /* Keep config, log, and saves next to the program even if launched from elsewhere. */
     ChangeDirectory(GetApplicationDirectory());
@@ -346,6 +349,14 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--cam") && i + 4 < argc)
             for (int k = 0; k < 4; k++) cam[k] = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--cam-y") && i + 1 < argc) cam_y = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--class-map") && i + 5 < argc) {
+            class_map = argv[++i];
+            for (int k = 0; k < 4; k++) class_rect[k] = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--probe") && i + 2 < argc) {
+            probe[nprobe][0] = atoi(argv[++i]);
+            probe[nprobe][1] = atoi(argv[++i]);
+            if (nprobe < 15) nprobe++;
+        }
         else if (!strcmp(argv[i], "--set") && i + 1 < argc) {
             char kv[128];
             snprintf(kv, sizeof kv, "%s", argv[++i]);
@@ -368,6 +379,8 @@ int main(int argc, char **argv)
     bool running = cfg.core[0] && cfg.rom[0] && start_game(allow_any_rom);
     if (running) config_save();
     view3d = view3d && world_ok;
+    for (int i = 0; i < nprobe && world_ok; i++) w3d_probe(probe[i][0], probe[i][1]);
+    if (class_map && world_ok) w3d_class_map(class_map, class_rect[0], class_rect[1], class_rect[2], class_rect[3]);
     if (view3d) {
         if (cam[0] >= 0) {
             viewer_place(cam[0], cam[1], 0);
