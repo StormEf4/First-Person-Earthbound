@@ -18,7 +18,9 @@ Controls (same as RetroArch's defaults; any gamepad also works):
   Q = L     W = R     Enter = Start     Right Shift = Select
 
 Extra keys:
-  F1 = show/hide the debug panel (Ness's position, facing, battle flags)
+  Tab (or F1) = show/hide the debug panel in the top-left corner
+                (Ness's X/Y position, facing direction, battle flags).
+                It's on by default and remembers your choice.
   F5 = save state    F9 = load state
 
 Saves: in-game saves go in a .srm file next to your ROM. To continue a save from

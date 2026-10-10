@@ -44,6 +44,7 @@ Q1–Q10 were answered in session 1 (see D3–D12). Still open:
 | D13 | 2026-10-10 | Stack (Claude's call; user can override): a **C program using raylib** that hosts the libretro core. It loads `snes9x_libretro.dll` from the user's existing RetroArch install, so no emulator is bundled. Windows .exe built by GitHub Actions. Look-and-feel settings live in hot-reloading text config and shader files. | Small and fast. Claude can build and run it end to end in the cloud session (Godot can't be downloaded here). |
 | D14 | 2026-10-10 | RAM addresses come from ebsrc's `ram.asm`, assembled with ca65 into a generated table | Exact addresses, no guessing |
 | D15 | 2026-10-10 | The ROM check lives inside FPEB.exe, not in a Python tool. Setup is drag-and-drop (core .dll and ROM onto the window), remembered in `fpeb.ini`. | User is creative-only on Windows, with no Python to run |
+| D16 | 2026-10-10 | Debug panel is **on by default**. Tab or F1 toggles it, and the choice is saved as `debug=` in `fpeb.ini`. When hidden, a faint "Tab: show debug info" hint stays on screen. Prefer non-F-keys for anything the user must press. | User couldn't see the panel (F1-only and hidden by default; laptop F-keys often need Fn) |
 
 ## Session History
 
@@ -55,6 +56,7 @@ Q1–Q10 were answered in session 1 (see D3–D12). Still open:
 - Verified in the cloud: Snes9x core built from source, plus a homebrew test ROM (`tests/testrom/`) that writes to Ness's X/Y addresses. `FPEB --frames 120 --debug --screenshot` showed the values changing; setup and rejection screens render correctly.
 - Not yet verified: the real EarthBound ROM (Q11), the Windows build on the user's machine, and audio (no sound device in the cloud).
 - **Next:** the user tests the Windows zip (Phase 0 🟡). Then Phase 1: ROM map/tileset/collision extraction for Onett.
+- User playtest #1: the game ran, but "no info HUD visible". Fixed per D16; new build pushed.
 
 ### How to test in a cloud session (so it doesn't need re-deriving)
 - Tools from source into /tmp: `git clone --branch V2.19 https://github.com/cc65/cc65 && make -C cc65 bin`; `git clone https://github.com/libretro/snes9x && make -C snes9x/libretro`.

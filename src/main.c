@@ -25,9 +25,10 @@
 typedef struct {
     char rom[1024];
     char core[1024];
+    int debug; /* show the debug panel */
 } Config;
 
-static Config cfg;
+static Config cfg = {.debug = 1};
 static char status[512];
 
 /* ---- config file: plain key=value lines ---- */
@@ -44,6 +45,7 @@ static void config_load(void)
         *eq = 0;
         if (strcmp(line, "rom") == 0) snprintf(cfg.rom, sizeof cfg.rom, "%s", eq + 1);
         if (strcmp(line, "core") == 0) snprintf(cfg.core, sizeof cfg.core, "%s", eq + 1);
+        if (strcmp(line, "debug") == 0) cfg.debug = atoi(eq + 1) != 0;
     }
     fclose(f);
 }
@@ -52,7 +54,7 @@ static void config_save(void)
 {
     FILE *f = fopen(CONFIG_FILE, "w");
     if (!f) return;
-    fprintf(f, "rom=%s\ncore=%s\n", cfg.rom, cfg.core);
+    fprintf(f, "rom=%s\ncore=%s\ndebug=%d\n", cfg.rom, cfg.core, cfg.debug);
     fclose(f);
 }
 
@@ -238,7 +240,8 @@ static void draw_debug_panel(void)
     char buf[1024];
     unsigned dir = lr_peek16(EB_LEADER_DIRECTION);
     snprintf(buf, sizeof buf,
-             "F1: hide   F5: save state   F9: load state\n"
+             "Tab or F1: hide this panel\n"
+             "F5: save state   F9: load state\n"
              "\n"
              "Ness X        %5u\n"
              "Ness Y        %5u\n"
@@ -252,8 +255,13 @@ static void draw_debug_panel(void)
              lr_peek16(EB_LEADER_X), lr_peek16(EB_LEADER_Y), dir, direction_name(dir),
              lr_peek16(EB_WALKING_STYLE), lr_peek8(EB_PARTY_COUNT), lr_peek16(EB_BATTLE_MODE_FLAG),
              lr_peek16(EB_BATTLE_MODE), lr_peek8(EB_FRAME_COUNTER), lr_audio_available());
-    DrawRectangle(8, 8, 380, 250, Fade(BLACK, 0.75f));
+    DrawRectangle(8, 8, 380, 270, Fade(BLACK, 0.75f));
     DrawText(buf, 18, 18, 18, RAYWHITE);
+}
+
+static void draw_debug_hint(void)
+{
+    DrawText("Tab: show debug info", 10, GetScreenHeight() - 24, 16, Fade(RAYWHITE, 0.5f));
 }
 
 static void draw_setup_screen(void)
@@ -306,7 +314,7 @@ int main(int argc, char **argv)
      * --debug (start with the F1 panel open). Paths are relative to the program's folder. */
     long test_frames = -1;
     const char *screenshot = NULL;
-    bool allow_any_rom = false, show_debug = false;
+    bool allow_any_rom = false, force_debug = false;
 
     /* Keep config, log, and saves next to the program even if launched from elsewhere. */
     ChangeDirectory(GetApplicationDirectory());
@@ -318,8 +326,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) test_frames = atol(argv[++i]);
         else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc) screenshot = argv[++i];
         else if (!strcmp(argv[i], "--any-rom")) allow_any_rom = true;
-        else if (!strcmp(argv[i], "--debug")) show_debug = true;
+        else if (!strcmp(argv[i], "--debug")) force_debug = true;
     }
+    if (force_debug) cfg.debug = 1;
     find_core();
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
@@ -362,7 +371,11 @@ int main(int argc, char **argv)
         }
 
         if (running) {
-            if (IsKeyPressed(KEY_F1)) show_debug = !show_debug;
+            /* Tab as well as F1: many laptop keyboards need Fn for the F-keys. */
+            if (IsKeyPressed(KEY_F1) || IsKeyPressed(KEY_TAB)) {
+                cfg.debug = !cfg.debug;
+                config_save();
+            }
             if (IsKeyPressed(KEY_F5)) log_msg(lr_save_state(state_path) ? "State saved\n" : "State save failed\n");
             if (IsKeyPressed(KEY_F9)) log_msg(lr_load_state(state_path) ? "State loaded\n" : "No state to load\n");
 
@@ -403,7 +416,8 @@ int main(int argc, char **argv)
         if (running) {
             ClearBackground(BLACK);
             if (tex.id) draw_game_texture(tex, tex_w, tex_h);
-            if (show_debug) draw_debug_panel();
+            if (cfg.debug) draw_debug_panel();
+            else draw_debug_hint();
         } else {
             draw_setup_screen();
         }
