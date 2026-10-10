@@ -2,22 +2,25 @@
 
 **How it works (D5):** `FPEB.exe` is a Windows program that runs the real EarthBound inside the Snes9x libretro core. All game logic (story, text, battles, items, saves) is the original game. Every frame, the program reads the game's memory (where Ness is, which way he faces, nearby NPCs, whether a battle or menu is open) and draws a 3D first-person scene instead of the top-down one. Text boxes, menus, and battle enemies come straight from the emulator's picture, layered over the 3D scene.
 
-**Current phase: 0**
+**Current phase: 1** (Phase 0 passed the user's playtest on 2026-10-10)
 
 🟡 = checkpoint where the user plays a build or makes a creative call before work continues. Claude writes all code (D3). Effort is given in working sessions.
 
+Major creative choices ship as **switchable options inside the build** (D20). The user flips between them while playing, picks one, and only then does work move on.
+
 ## Phase 0 — Foundation (1–2 sessions)
 - ✅ RAM symbol table generated from ebsrc (D14): `src/eb_ram.h`.
-- ✅ `FPEB.exe`, version 0: loads `snes9x_libretro.dll` from RetroArch plus the ROM, and plays EarthBound normally (video, audio, gamepad and keyboard). Press F1 for a debug panel showing live values: game state, Ness's X/Y/direction, battle flag.
+- ✅ `FPEB.exe`, version 0: loads `snes9x_libretro.dll` from RetroArch plus the ROM, and plays EarthBound normally (video, audio, gamepad and keyboard). Tab/F1 debug panel (on by default, D16) showing live values: game state, Ness's X/Y/direction, battle flag.
 - ✅ The ROM check is built into the program, which rejects Mother 2 and other games with a clear message.
 - ✅ GitHub Actions builds the Windows .exe on every push, so the user just downloads a zip.
-- 🟡 **User:** download the zip, point it at the ROM and RetroArch, and confirm the game plays and the debug numbers move when Ness walks.
+- ✅ 🟡 **User playtest passed:** game, sound, X/Y, and facing (0 up, 2 right, 4 down, 6 left) all accurate.
 
 ## Phase 1 — The world in 3D (2–3 sessions)
 - Read map tiles, tilesets, palettes, and collision for the Onett area directly from the user's ROM at startup (no assets shipped).
 - Build 3D geometry: floor from ground tiles, walls raised from collision, building fronts textured with their own tile art (D11). Night palette.
 - A free-fly camera to look around.
-- 🟡 **User:** fly around Onett. Creative calls: wall heights, fog and draw distance, pixel crunchiness (Q13), lighting mood.
+- Chunky low-res look (D19), with several resolution and pixel-size presets to flip between.
+- 🟡 **User:** fly around Onett and flip between the presets. Pick wall height, fog and draw distance, resolution and pixel size, and lighting mood.
 
 ## Phase 2 — Seeing through Ness's eyes (2–3 sessions)
 - The camera sits at Ness's real position. Free movement and turning (D7): mouse or right stick turns, and movement is fed to the game so its own collision, doors, and triggers still fire.
