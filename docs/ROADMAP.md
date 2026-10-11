@@ -28,6 +28,7 @@ Major creative choices ship as **switchable options inside the build** (D20). Th
   - Debug flags: `--probe px py` and `--class-map file tx ty tw th`.
 - ✅ User: "the entire town is a jumbled mess". Rebuilt around the projection rule (D26) after an 825-shot reference survey (D27).
 - 🟡 **User:** fly around the new build and point out the worst remaining spots.
+- ✅ Terrain elevation: raised hills, terraces, ramps (D29). Forests as groves, 3D fences, trunk-only bases (D30).
 - Known leftovers: tree rows that touch a cliff merge into it and render as ledge; staircase edges on diagonal cliff lips; close-up hedge strips look flat; terrain has no real elevation (plateaus aren't raised).
 
 ## Phase 2 — Seeing through Ness's eyes (2–3 sessions)

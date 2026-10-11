@@ -23,6 +23,11 @@ static int art_rows_above(int id, int mx, int base, const Keys *keys, bool event
 static int column_bottom(int id, int mx, int y0, int y1);
 static void detect_shape(int id, int W, int R);
 
+static void classify_cliffs(void);
+static bool rock_cell(int mx, int my, bool event);
+static int owner_at(int mx, int my);
+static void solve_ground(void);
+
 static int median(int *v, int n)
 {
     for (int a = 1; a < n; a++)
@@ -169,6 +174,12 @@ typedef struct {
     bool forest;  /* big masses of trees: a solid wall of tree art */
     bool thin;    /* fences and railings: cut out with every ground colour removed */
     bool hidden;  /* nothing to show (an invisible blocker with only ground art) */
+    bool cliff;   /* a rock face between two ground levels: nothing walks behind it */
+    bool green;   /* leafy art (hedges, groves) */
+    bool fence_made;
+    float fence_h;
+    Rectangle fence_src; /* one picket column, repeated along the fence */
+    bool voidc;   /* off-map backdrop (the starry sky past the hilltop): not drawn at all */
     bool blueprint; /* a hand-placed building (blueprints.c): never reclassified */
     bool erased;    /* its art above the footprint has been wiped from the floor */
     /* Shaped buildings: the bottom wall_rows of the art are the front wall, the top roof_rows are
@@ -184,6 +195,10 @@ static bool looks_like_prop(const Object *o);
 static int building_depth(const Object *o);
 
 static uint8_t *solid_grid;
+static float *ground;      /* ground height per minitile, in world units (cliff cells: their top) */
+static int32_t *fg_owner;  /* walk-behind cell -> the object standing directly beneath it, or -1 */
+static uint8_t *cell_kind; /* CELL_* below */
+enum { CELL_GROUND, CELL_CLIFF, CELL_VOID };
 static uint8_t *tree_cell; /* in cliff/forest masses: this cell's art is tree canopy */
 static int32_t *object_of; /* per minitile, -1 when open */
 static Object *objects;
@@ -274,6 +289,19 @@ static void analyse_world(void)
                     for (int dx = -1; dx <= 1; dx++) bulky[(y + dy) * EBW_MINI_W + x + dx] = 1;
         }
 
+    /* under_art: the column above this cell (through solid cells) ends in walk-behind art within
+     * two rows: a trunk under its canopy, walls under a roof. Fences have nothing above them. */
+    uint8_t *under_art = calloc(n, 1);
+    for (int x = 0; x < EBW_MINI_W; x++)
+        for (int y = 0; y < EBW_MINI_H; y++) {
+            if (!solid_grid[y * EBW_MINI_W + x]) continue;
+            int t = y;
+            while (t > 0 && solid_grid[(t - 1) * EBW_MINI_W + x]) t--;
+            bool art = false;
+            for (int k = 1; k <= 3 && t - k >= 0 && !art; k++) art = ebw_foreground_at(x, t - k);
+            under_art[y * EBW_MINI_W + x] = art;
+        }
+
     for (int start = 0; start < n; start++) {
         if (!solid_grid[start] || object_of[start] >= 0) continue;
         if (object_count == cap) {
@@ -296,11 +324,13 @@ static void analyse_world(void)
             if (x > o->x1) o->x1 = x;
             if (y < o->y0) o->y0 = y;
             if (y > o->y1) o->y1 = y;
-            const int nb[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-            for (int k = 0; k < 4; k++) {
+            /* Thin cells also join diagonally: a diagonal fence touches only corner to corner. */
+            const int nb[8][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {-1, 1}, {1, -1}, {-1, -1}};
+            for (int k = 0; k < (bulky[c] || under_art[c] ? 4 : 8); k++) {
                 int nx = x + nb[k][0], ny = y + nb[k][1];
                 if (nx < 0 || ny < 0 || nx >= EBW_MINI_W || ny >= EBW_MINI_H) continue;
                 int ni = ny * EBW_MINI_W + nx;
+                if (k >= 4 && under_art[ni]) continue;
                 if (solid_grid[ni] && object_of[ni] < 0 && bulky[ni] == bulky[c]) {
                     object_of[ni] = object_count;
                     stack[sp++] = ni;
@@ -310,6 +340,7 @@ static void analyse_world(void)
         object_count++;
     }
     free(bulky);
+    free(under_art);
 
     /* Average depth of each object's vertical runs: how far its art extends "up" the screen. */
     for (int mx = 0; mx < EBW_MINI_W; mx++) {
@@ -368,6 +399,7 @@ static void analyse_world(void)
         bool thin = !o->indoors && !o->is_prop && (o->thin || w <= 2 || h <= 2);
         o->thin = thin;
         bool green_art = total[i] && green[i] * 10 >= total[i] * 6;
+        o->green = green_art;
         o->forest = green_art && !thin && o->cells > 60;
         o->foliage = thin || (green_art && !o->forest);
         /* Buildings are compact blocks; cliffs sprawl along diagonals and leave their box mostly empty. */
@@ -424,7 +456,347 @@ static void analyse_world(void)
         detect_shape(i, W, R);
     }
     free(stack);
+    /* Each stack of walk-behind cells belongs to the solid run directly beneath it (a canopy to
+     * its trunk, a roof to its walls), so cut-outs never borrow a neighbour's art. */
+    fg_owner = malloc(sizeof(int32_t) * n);
+    memset(fg_owner, 0xFF, sizeof(int32_t) * n);
+    for (int mx = 0; mx < EBW_MINI_W; mx++)
+        for (int my = EBW_MINI_H - 1; my > 0; my--) {
+            int id = object_of[my * EBW_MINI_W + mx];
+            if (id < 0 || object_of[(my - 1) * EBW_MINI_W + mx] == id) continue; /* run tops only */
+            /* A tree's lowest canopy rows (just above the trunk) aren't marked: allow a gap of up to
+             * two unmarked rows before the marked stack starts. */
+            int fy = my - 1, gap = 0;
+            while (fy >= 0 && gap < 2 && object_of[fy * EBW_MINI_W + mx] < 0 && !ebw_foreground_at(mx, fy)) fy--, gap++;
+            for (; fy >= 0 && fy >= my - 18; fy--) {
+                int c = fy * EBW_MINI_W + mx;
+                if (object_of[c] >= 0 || !ebw_foreground_at(mx, fy)) break;
+                fg_owner[c] = id;
+            }
+        }
+    double t0 = GetTime();
+    classify_cliffs();
+    solve_ground();
+    TraceLog(LOG_INFO, "world: %d objects, ground solved in %.2f s", object_count, GetTime() - t0);
     analysed = true;
+}
+
+/* ---- ground elevation ---- */
+
+/* Cliffs: outdoor solid masses that nothing walks behind (no walk-behind cells above them, unlike
+ * buildings and trees) and that aren't leafy, plus every sprawling terrain mass. Inside those,
+ * each cell decides for itself: rock is cliff, sky-blue or black is off-map void, and tree canopy
+ * is ground (with trees on it). */
+static void classify_cliffs(void)
+{
+    const int n = EBW_MINI_W * EBW_MINI_H;
+    cell_kind = calloc(n, 1);
+    for (int i = 0; i < object_count; i++) {
+        Object *o = &objects[i];
+        o->cliff = o->voidc = false;
+        if (o->indoors || o->is_prop || o->blueprint) continue;
+        if (o->terrain || o->forest) {
+            o->cliff = true;
+            continue;
+        }
+        if (o->foliage && !o->thin) continue; /* hedges and groves */
+        int cols = 0, fg_cols = 0;
+        for (int mx = o->x0; mx <= o->x1; mx++) {
+            int base = column_bottom(i, mx, o->y0, o->y1);
+            if (base < 0) continue;
+            cols++;
+            int top = base;
+            while (object_at(mx, top - 1) == i) top--;
+            if (ebw_foreground_at(mx, top - 1)) fg_cols++;
+        }
+        if (!cols || fg_cols * 100 >= cols * 15) continue;
+        if (o->thin && o->cells < 12) continue; /* posts and short rails stay cut-outs */
+        /* Only rock is a cliff: walls, planters, and hedges keep their own shapes. */
+        int rock = 0, all = 0;
+        for (int my = o->y0; my <= o->y1; my++)
+            for (int mx = o->x0; mx <= o->x1; mx++)
+                if (object_at(mx, my) == i) all++, rock += rock_cell(mx, my, false);
+        if (rock * 2 < all) continue;
+        o->cliff = true;
+    }
+    for (int c = 0; c < n; c++) {
+        int id = object_of[c];
+        if (id < 0 || !objects[id].cliff) continue;
+        if (tree_cell[c]) continue; /* canopy inside a mass: ground, trees go on it */
+        int mx = c % EBW_MINI_W, my = c / EBW_MINI_W;
+        long r = 0, g = 0, b = 0;
+        for (int i = 0; i < 64; i += 4) {
+            uint32_t px = pixel_at(mx * 8 + (i & 7), my * 8 + (i >> 3), false);
+            r += px & 0xFF, g += (px >> 8) & 0xFF, b += (px >> 16) & 0xFF;
+        }
+        r /= 16, g /= 16, b /= 16;
+        bool sky = b > r + 20 && b > g + 20, black = r < 40 && g < 40 && b < 40;
+        if (sky || black) {
+            cell_kind[c] = CELL_VOID;
+            continue;
+        }
+        /* Rock, or an outline row between rock: cliff. Anything else in a mass (grass lips, tree
+         * bits) is plain ground on whichever level it touches. */
+        bool rock = rock_cell(mx, my, false) || (rock_cell(mx, my - 1, false) && rock_cell(mx, my + 1, false));
+        cell_kind[c] = rock ? CELL_CLIFF : CELL_GROUND;
+    }
+}
+
+/* One relation between two ground cells: ground[upper] = ground[lower] + d. */
+typedef struct {
+    int lower, upper;
+    float d;
+} Rise;
+
+#define CLIFF_K 8.0f /* weight of a cliff rise against ground smoothness */
+
+/* y = A x for the ground energy: grid Laplacian over ground cells plus CLIFF_K per rise link. */
+static void cg_apply(const float *x, float *y, const uint8_t *dom, const int *st, const int *ot)
+{
+    const int w = EBW_MINI_W, hgt = EBW_MINI_H;
+    for (int yy = 0; yy < hgt; yy++)
+        for (int xx = 0; xx < w; xx++) {
+            int i = yy * w + xx;
+            if (!dom[i]) {
+                y[i] = 0;
+                continue;
+            }
+            float v = 0, xi = x[i];
+            if (xx > 0 && dom[i - 1]) v += xi - x[i - 1];
+            if (xx + 1 < w && dom[i + 1]) v += xi - x[i + 1];
+            if (yy > 0 && dom[i - w]) v += xi - x[i - w];
+            if (yy + 1 < hgt && dom[i + w]) v += xi - x[i + w];
+            for (int e = st[i]; e < st[i + 1]; e++) v += CLIFF_K * (xi - x[ot[e]]);
+            y[i] = v;
+        }
+}
+
+static void cg_solve(float *x, const uint8_t *dom, const int *st, const int *ot, const float *dl, int iters)
+{
+    const int n = EBW_MINI_W * EBW_MINI_H;
+    float *r = malloc(sizeof(float) * n), *p = malloc(sizeof(float) * n), *ap = malloc(sizeof(float) * n);
+    cg_apply(x, ap, dom, st, ot);
+    double rr = 0;
+    for (int i = 0; i < n; i++) {
+        float b = 0;
+        if (dom[i])
+            for (int e = st[i]; e < st[i + 1]; e++) b += CLIFF_K * dl[e];
+        r[i] = dom[i] ? b - ap[i] : 0;
+        p[i] = r[i];
+        rr += (double)r[i] * r[i];
+    }
+    for (int it = 0; it < iters && rr > 1e-6; it++) {
+        cg_apply(p, ap, dom, st, ot);
+        double pap = 0;
+        for (int i = 0; i < n; i++) pap += (double)p[i] * ap[i];
+        if (pap <= 0) break;
+        float alpha = (float)(rr / pap);
+        double rr2 = 0;
+        for (int i = 0; i < n; i++) {
+            x[i] += alpha * p[i];
+            r[i] -= alpha * ap[i];
+            rr2 += (double)r[i] * r[i];
+        }
+        float beta = (float)(rr2 / rr);
+        rr = rr2;
+        for (int i = 0; i < n; i++) p[i] = r[i] + beta * p[i];
+    }
+    free(r), free(p), free(ap);
+}
+
+/* Builds per-cell link lists (CSR) from rises. */
+static void link_lists(const Rise *rises, int nr, int ncells, int **start, int **other, float **delta)
+{
+    *start = calloc(ncells + 1, sizeof(int));
+    for (int r = 0; r < nr; r++) (*start)[rises[r].lower + 1]++, (*start)[rises[r].upper + 1]++;
+    for (int i = 0; i < ncells; i++) (*start)[i + 1] += (*start)[i];
+    int *fill = malloc(sizeof(int) * ncells);
+    memcpy(fill, *start, sizeof(int) * ncells);
+    *other = malloc(sizeof(int) * (nr * 2 + 1));
+    *delta = malloc(sizeof(float) * (nr * 2 + 1));
+    for (int r = 0; r < nr; r++) {
+        int a = rises[r].lower, b = rises[r].upper;
+        (*other)[fill[a]] = b, (*delta)[fill[a]++] = -rises[r].d;
+        (*other)[fill[b]] = a, (*delta)[fill[b]++] = rises[r].d;
+    }
+    free(fill);
+}
+
+/* Every cliff column says "the ground above me is my height higher than the ground below me".
+ * Solving for one smooth ground that keeps all of those makes plateaus flat, terraces stepped,
+ * and the paths between them ramps. Solved coarse (4x) first, then refined. */
+static void solve_ground(void)
+{
+    const int n = EBW_MINI_W * EBW_MINI_H;
+    uint8_t *dom = malloc(n);
+    for (int c = 0; c < n; c++) dom[c] = cell_kind[c] == CELL_GROUND;
+
+    int cap = 65536, nr = 0;
+    Rise *rises = malloc(sizeof(Rise) * cap);
+    for (int mx = 0; mx < EBW_MINI_W; mx++)
+        for (int my = 1; my + 1 < EBW_MINI_H; my++) {
+            if (cell_kind[my * EBW_MINI_W + mx] != CELL_CLIFF || cell_kind[(my + 1) * EBW_MINI_W + mx] == CELL_CLIFF)
+                continue; /* run bottoms */
+            int top = my;
+            while (top > 0 && cell_kind[(top - 1) * EBW_MINI_W + mx] == CELL_CLIFF) top--;
+            int lo = (my + 1) * EBW_MINI_W + mx, hi = (top - 1) * EBW_MINI_W + mx;
+            if (top - 1 < 0 || !dom[lo] || !dom[hi]) continue;
+            if (nr == cap) rises = realloc(rises, sizeof(Rise) * (cap *= 2));
+            rises[nr++] = (Rise){lo, hi, (my - top + 1) * OUTDOOR_SCALE};
+        }
+
+    /* Terraces: connected ground between cliffs. Each gets one flat height; the heights are fitted
+     * (least squares) so cliff rises between terraces match their art. A rise that starts and ends
+     * on the same terrace (a ramp drawn as a slope) is smoothed in afterwards. */
+    int32_t *terr = malloc(sizeof(int32_t) * n);
+    memset(terr, 0xFF, sizeof(int32_t) * n);
+    int nterr = 0;
+    int32_t *stk = malloc(sizeof(int32_t) * n);
+    for (int c0 = 0; c0 < n; c0++) {
+        if (!dom[c0] || terr[c0] >= 0) continue;
+        int sp = 0;
+        stk[sp++] = c0;
+        terr[c0] = nterr;
+        while (sp) {
+            int c = stk[--sp], x = c % EBW_MINI_W, y = c / EBW_MINI_W;
+            const int nb[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+            for (int k = 0; k < 4; k++) {
+                int nx = x + nb[k][0], ny = y + nb[k][1];
+                if (nx < 0 || ny < 0 || nx >= EBW_MINI_W || ny >= EBW_MINI_H) continue;
+                int ni = ny * EBW_MINI_W + nx;
+                if (dom[ni] && terr[ni] < 0) terr[ni] = nterr, stk[sp++] = ni;
+            }
+        }
+        nterr++;
+    }
+    free(stk);
+
+    /* Edges between terraces: summed rise and count per (lower, upper) link. */
+    Rise *trises = malloc(sizeof(Rise) * (nr + 1));
+    int ntr = 0;
+    uint8_t *self_rise = calloc(nterr, 1);
+    for (int r = 0; r < nr; r++) {
+        int a = terr[rises[r].lower], b = terr[rises[r].upper];
+        if (a == b) {
+            self_rise[a] = 1;
+            continue;
+        }
+        trises[ntr++] = (Rise){a, b, rises[r].d};
+    }
+    float *th = calloc(nterr, sizeof(float));
+    int *st, *ot;
+    float *dl;
+    link_lists(trises, ntr, nterr, &st, &ot, &dl);
+    /* Gauss-Seidel on the terrace graph: each terrace sits at the average its cliffs ask for. */
+    for (int it = 0; it < 4000; it++) {
+        float change = 0;
+        for (int t = 0; t < nterr; t++) {
+            if (st[t] == st[t + 1]) continue;
+            float sum = 0;
+            for (int e = st[t]; e < st[t + 1]; e++) sum += th[ot[e]] + dl[e];
+            float v = sum / (st[t + 1] - st[t]);
+            change += fabsf(v - th[t]);
+            th[t] = v;
+        }
+        if (change < 0.01f) break;
+    }
+    free(st), free(ot), free(dl);
+
+    ground = calloc(n, sizeof(float));
+    for (int c = 0; c < n; c++) ground[c] = dom[c] ? th[terr[c]] : 0;
+
+    /* Refine the whole field: least squares over smoothness between neighbouring ground cells plus
+     * every cliff rise (including those within one terrace), solved by conjugate gradients from the
+     * terrace solution. Plateaus stay nearly flat, cliffs keep their drops, and where the ground
+     * wraps around a cliff's end it ramps. */
+    link_lists(rises, nr, n, &st, &ot, &dl);
+    cg_solve(ground, dom, st, ot, dl, 600);
+    free(st), free(ot), free(dl);
+    free(th), free(trises), free(self_rise), free(terr);
+
+    float *cliff_top = malloc(sizeof(float) * n);
+    /* Shift so the lowest ground sits at 0. */
+    float lo = 1e9f;
+    for (int c = 0; c < n; c++)
+        if (dom[c] && ground[c] < lo) lo = ground[c];
+    for (int c = 0; c < n; c++) ground[c] = dom[c] ? ground[c] - lo : 0;
+    /* Non-ground cells that aren't cliffs (void) take their neighbours' level, never 0. */
+
+    /* Cliff cells carry the height of the ground above them (their top surface). Where there's no
+     * ground above (the edge of the world), the face rises its own height from the ground below. */
+    for (int mx = 0; mx < EBW_MINI_W; mx++)
+        for (int my = 0; my < EBW_MINI_H; my++) {
+            if (cell_kind[my * EBW_MINI_W + mx] != CELL_CLIFF) continue;
+            int top = my, bot = my;
+            while (top > 0 && cell_kind[(top - 1) * EBW_MINI_W + mx] == CELL_CLIFF) top--;
+            while (bot + 1 < EBW_MINI_H && cell_kind[(bot + 1) * EBW_MINI_W + mx] == CELL_CLIFF) bot++;
+            int above = (top - 1) * EBW_MINI_W + mx, below = (bot + 1) * EBW_MINI_W + mx;
+            float h;
+            if (top > 0 && dom[above]) h = ground[above];
+            else if (bot + 1 < EBW_MINI_H && dom[below]) h = ground[below] + (bot - top + 1) * OUTDOOR_SCALE;
+            else h = ground[my * EBW_MINI_W + mx];
+            cliff_top[my * EBW_MINI_W + mx] = h;
+        }
+    for (int c = 0; c < n; c++)
+        if (cell_kind[c] == CELL_CLIFF) ground[c] = cliff_top[c];
+    free(cliff_top);
+    free(dom), free(rises);
+}
+
+static int owner_at(int mx, int my)
+{
+    if (mx < 0 || my < 0 || mx >= EBW_MINI_W || my >= EBW_MINI_H || !fg_owner) return -1;
+    return fg_owner[my * EBW_MINI_W + mx];
+}
+
+/* Cliff art mixes rock with the grass lip and the diagonal slopes drawn in green. Faces should be
+ * rock: use the wanted row if it's rock-coloured, else the nearest rock row in the column (or a
+ * neighbouring column). */
+static bool rock_cell(int mx, int my, bool event)
+{
+    int rock = 0, lit = 0;
+    for (int i = 0; i < 64; i += 3) {
+        uint32_t c = pixel_at(mx * 8 + (i & 7), my * 8 + (i >> 3), event);
+        int r = c & 0xFF, g = (c >> 8) & 0xFF, b = (c >> 16) & 0xFF;
+        if (r < 60 && g < 60 && b < 60) continue;
+        lit++;
+        if (r > g + 15 && r > b) rock++;
+    }
+    return lit && rock * 10 >= lit * 6;
+}
+
+static int rock_row(int mx, int top, int bot, int want, bool event)
+{
+    if (rock_cell(mx, want, event)) return want;
+    for (int d = 1; d <= bot - top; d++) {
+        if (want + d <= bot && rock_cell(mx, want + d, event)) return want + d;
+        if (want - d >= top && rock_cell(mx, want - d, event)) return want - d;
+    }
+    return want;
+}
+
+static float ground_at(int mx, int my)
+{
+    if (mx < 0 || my < 0 || mx >= EBW_MINI_W || my >= EBW_MINI_H || !ground) return 0;
+    return ground[my * EBW_MINI_W + mx];
+}
+
+static int kind_at(int mx, int my)
+{
+    if (mx < 0 || my < 0 || mx >= EBW_MINI_W || my >= EBW_MINI_H || !cell_kind) return CELL_VOID;
+    return cell_kind[my * EBW_MINI_W + mx];
+}
+
+/* Height of a cell corner (vertex at mx,my = top-left of cell mx,my), averaged over the cells of
+ * the given kind that share it, so ground stays smooth but cliff edges stay sharp. */
+static float corner_height(int vx, int vy, int kind, float fallback)
+{
+    float sum = 0;
+    int cnt = 0;
+    for (int dy = -1; dy <= 0; dy++)
+        for (int dx = -1; dx <= 0; dx++)
+            if (kind_at(vx + dx, vy + dy) == kind) sum += ground_at(vx + dx, vy + dy), cnt++;
+    return cnt ? sum / cnt : fallback;
 }
 
 /* Small things (trees, bushes, signs, posts) become cut-out sprites; the rest are solid. */
@@ -506,11 +878,20 @@ static void detect_shape(int id, int W, int R)
 #define PROP_ATLAS 2048
 
 typedef struct {
-    float x, z, w, h;
-    Rectangle src; /* in the prop atlas */
+    float x, y, z, w, h; /* y: ground height at its base */
+    Rectangle src;       /* in the prop atlas */
 } Prop;
 
 static Texture2D prop_atlas;
+
+/* Standalone trees already cut out, reused to plant forests as groves of individual trees. */
+typedef struct {
+    Rectangle src;
+    float w, h;
+    uint32_t ground;
+} TreeTemplate;
+static TreeTemplate tree_tpl[8];
+static int tree_tpl_count;
 static int shelf_x, shelf_y, shelf_h;
 
 /* Pixels erased from the floor where a prop used to be painted; per map tile, 0 = unchanged. */
@@ -535,6 +916,7 @@ static bool pack_prop(int w, int h, Rectangle *out)
 
 static void patch_floor(int px, int py, uint32_t colour, bool event)
 {
+    if (px < 0 || py < 0 || px >= EBW_MAP_W * 32 || py >= EBW_MAP_H * 32) return;
     int t = (py >> 5) * EBW_MAP_W + (px >> 5);
     uint32_t **patches = floor_patch[event ? 1 : 0];
     if (!patches[t]) patches[t] = calloc(32 * 32, sizeof(uint32_t));
@@ -638,15 +1020,42 @@ static bool cut_out(int id, int wx0, int wy0, int ww, int wh, const Keys *keys, 
             bool fg = false;
             if (obj == -1 && px >= 0 && py >= 0) {
                 int cx = px >> 3, cy = py >> 3;
-                fg = ebw_foreground_at(cx, cy);
+                fg = owner_at(cx, cy) == id || (owner_at(cx, cy) < 0 && ebw_foreground_at(cx, cy));
                 /* Leafy things: the game marks only the upper canopy as walk-behind; the rows just
                  * below it, down to the trunk, are canopy too. */
-                if (!fg && leafy && py < open_max_py)
-                    fg = ebw_foreground_at(cx, cy - 1) || ebw_foreground_at(cx, cy - 2);
+                if (!fg && leafy && py < open_max_py && !ebw_foreground_at(cx, cy))
+                    for (int up = 1; up <= 2 && !fg; up++)
+                        fg = ebw_foreground_at(cx, cy - up) && (owner_at(cx, cy - up) == id || owner_at(cx, cy - up) < 0);
             }
             bool allowed = (obj == id || fg) && !is_key(k, c);
+            /* Leafy cut-outs keep only tree colours (greens, outlines, trunk browns): canopies are
+             * painted over walls in the original art, and the wall mustn't come along. */
+            if (allowed && leafy) {
+                int r = c & 0xFF, g = (c >> 8) & 0xFF, b = (c >> 16) & 0xFF;
+                int hi = r > g ? (r > b ? r : b) : (g > b ? g : b);
+                bool tree_colour = (g > r && g + 10 >= b) || hi < 90 || (r > g && r > b && b < 140);
+                if (!tree_colour) allowed = false;
+                /* At the base only the trunk and roots stand up; the painted shadow stays on the
+                 * ground (outlines only next to bark). */
+                if (allowed && py >= base_py) {
+                    bool bark = r > g + 10 && r > b;
+                    if (!bark && hi < 90) {
+                        bark = false;
+                        const int nb[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+                        for (int q = 0; q < 4 && !bark; q++) {
+                            uint32_t n2 = pixel_at(px + nb[q][0], py + nb[q][1], event);
+                            int nr = n2 & 0xFF, ng = (n2 >> 8) & 0xFF, nbb = (n2 >> 16) & 0xFF;
+                            bark = nr > ng + 10 && nr > nbb;
+                        }
+                    }
+                    if (!bark) allowed = false;
+                }
+            }
             mask[y * ww + x] = allowed ? 1 : 0;
-            if (allowed && obj == id) {
+            /* Seeds: the object's own cells and the walk-behind art it owns (its canopy), so a
+             * trunk row trimmed to bark can't cut the canopy off. */
+            bool owned = obj == id || (px >= 0 && py >= 0 && owner_at(px >> 3, py >> 3) == id);
+            if (allowed && owned) {
                 mask[y * ww + x] = 2;
                 queue[qn++] = y * ww + x;
             }
@@ -694,6 +1103,7 @@ static bool cut_out(int id, int wx0, int wy0, int ww, int wh, const Keys *keys, 
     out->h = bh / 8.0f;
     out->x = (wx0 + bx0 + bw * 0.5f) / 8.0f;
     out->z = z;
+    out->y = ground_at((int)out->x, (int)z);
     return true;
 }
 
@@ -705,9 +1115,26 @@ static bool make_prop(Object *o, bool event, Prop *out)
     int id = (int)(o - objects);
     /* A canopy may hang over the top half of the trunk rows, but not down to the ground. */
     int open_max = (o->y0 + (o->y1 - o->y0 + 1) / 2) * 8;
-    return cut_out(id, (o->x0 - 2) * 8, (o->y0 - 8) * 8, (o->x1 - o->x0 + 5) * 8, (o->y1 - o->y0 + 9) * 8, &keys,
-                   &base_keys, (o->y1 > o->y0 ? o->y1 - 1 : o->y1) * 8, open_max, event,
-                   (o->y0 + o->y1 + 1) * 0.5f, out);
+    int wx0 = (o->x0 - 2) * 8, wy0 = (o->y0 - 8) * 8, ww = (o->x1 - o->x0 + 5) * 8, wh = (o->y1 - o->y0 + 9) * 8;
+    /* Bark-only through the trunk rows (from the middle of the top one), where the painted shadow
+     * sits; the canopy above is unaffected. */
+    int bark_from = o->y1 > o->y0 ? o->y0 * 8 + 5 : o->y1 * 8 + 4;
+    bool ok = cut_out(id, wx0, wy0, ww, wh, &keys, &base_keys, bark_from, open_max,
+                      event, (o->y0 + o->y1 + 1) * 0.5f, out);
+    /* A typical round tree becomes a template for planting forests. */
+    if (ok && tree_tpl_count < 8 && is_leafy(id, wx0, wy0, ww, wh, event) && out->w >= 3 && out->w <= 7 &&
+        out->h >= 4 && out->h <= 9)
+        tree_tpl[tree_tpl_count++] = (TreeTemplate){out->src, out->w, out->h, keys.c[0]};
+    return ok;
+}
+
+/* True if any walk-behind cell above the object belongs to it (a canopy, a board, a roof). */
+static bool owns_art_above(int id, const Object *o)
+{
+    for (int mx = o->x0; mx <= o->x1; mx++)
+        for (int my = o->y0 - 4; my < o->y0; my++)
+            if (owner_at(mx, my) == id) return true;
+    return false;
 }
 
 /* One column of a tree cluster: the run of solid cells ending at `base`, plus canopy above. */
@@ -733,17 +1160,139 @@ static bool make_strip(int id, int mx, int base, bool event, Prop *out)
 #define CHUNK_MW (EBW_SECTOR_W * 4) /* minitiles */
 #define CHUNK_MH (EBW_SECTOR_H * 4)
 
+/* A straight run of fence between two cell centres, wearing a repeated picket column. */
+typedef struct {
+    float x0, z0, y0, x1, z1, y1, h;
+    Rectangle src;
+} FenceSeg;
+
 typedef struct {
     bool built, has_mesh, props_done;
     Mesh mesh;
     Prop *props;
     int nprops;
+    FenceSeg *fences;
+    int nfences;
     int last_used;
 } Chunk;
 
 static Chunk chunks[EBW_SECTORS_Y][EBW_SECTORS_X];
 static int frame_no;
 static bool chunks_pending; /* last frame wanted to build more chunks than its budget allowed */
+
+static void chunk_add_prop(Chunk *c, Prop p)
+{
+    c->props = realloc(c->props, sizeof(Prop) * (c->nprops + 1));
+    c->props[c->nprops++] = p;
+}
+
+static void ensure_props(int sx, int sy, bool event);
+
+/* One fence cell: link it to its fence neighbours with straight picket runs, and wipe the
+ * painted fence (and its shadow) off the ground. */
+static void add_fence_cell(Chunk *c, int id, int mx, int my, bool event)
+{
+    Object *o = &objects[id];
+    if (!o->fence_made) {
+        /* Picket template: a column where the fence runs straight across (neighbours east and
+         * west), else any of its cells. */
+        int bx = -1, by = -1;
+        for (int y = o->y0; y <= o->y1 && bx < 0; y++)
+            for (int x = o->x0; x <= o->x1; x++)
+                if (object_at(x, y) == id && object_at(x - 1, y) == id && object_at(x + 1, y) == id &&
+                    object_at(x, y + 1) != id) {
+                    bx = x, by = y;
+                    break;
+                }
+        if (bx < 0) bx = mx, by = column_bottom(id, mx, o->y0, o->y1);
+        Prop p;
+        o->fence_made = true;
+        Keys fk, floose;
+        bool keyed = by >= 0 && ground_keys(bx, bx, by, by, event, &fk);
+        if (keyed) ground_keys_pct(bx - 2, bx + 2, by, by, event, &floose, 3);
+        /* Pickets: the fence's own cell and the row above it (the picket tops), nothing more. */
+        if (keyed && cut_out(id, bx * 8, (by - 1) * 8, 8, 16, &fk, &floose, 0, (by - 1) * 8, event, by + 0.5f, &p)) {
+            o->fence_src = p.src;
+            o->fence_h = p.h * OUTDOOR_SCALE;
+        } else {
+            o->fence_h = 0;
+        }
+    }
+    Keys loose;
+    if (ground_keys_pct(mx - 2, mx + 2, my, my, event, &loose, 3)) {
+        /* Fill with the ground right under this cell (grass, not the path beside it). */
+        uint32_t cols[64];
+        int cnt[64] = {0}, nc = 0, best = 0;
+        for (int i = 0; i < 64; i++) {
+            uint32_t c = pixel_at(mx * 8 + (i & 7), (my + 1) * 8 + (i >> 3), event);
+            int k = 0;
+            while (k < nc && cols[k] != c) k++;
+            if (k == nc) cols[nc++] = c;
+            if (++cnt[k] > cnt[best]) best = k;
+        }
+        uint32_t fill = nc ? cols[best] : loose.c[0];
+        for (int ry = my - 3; ry <= my; ry++) {
+            if (ry != my && object_at(mx, ry) >= 0) continue;
+            for (int i = 0; i < 64; i++) {
+                int px = mx * 8 + (i & 7), py = ry * 8 + (i >> 3);
+                if (!is_key(&loose, pixel_at(px, py, event))) patch_floor(px, py, fill, event);
+            }
+        }
+    }
+    if (o->fence_h <= 0) return;
+    /* Links: east and south; diagonals only where no straight path joins the two cells. */
+    const int links[4][2] = {{1, 0}, {0, 1}, {1, 1}, {-1, 1}};
+    for (int k = 0; k < 4; k++) {
+        int nx = mx + links[k][0], ny = my + links[k][1];
+        if (object_at(nx, ny) != id) continue;
+        if (k == 2 && (object_at(mx + 1, my) == id || object_at(mx, my + 1) == id)) continue;
+        if (k == 3 && (object_at(mx - 1, my) == id || object_at(mx, my + 1) == id)) continue;
+        c->fences = realloc(c->fences, sizeof(FenceSeg) * (c->nfences + 1));
+        c->fences[c->nfences++] = (FenceSeg){mx + 0.5f, my + 0.5f, ground_at(mx, my), nx + 0.5f, ny + 0.5f,
+                                             ground_at(nx, ny), o->fence_h, o->fence_src};
+    }
+}
+
+/* Forest canopy cells: wipe the canopy off the ground and plant individual trees, cloned from
+ * standalone trees cut out nearby, on a jittered 3-cell grid. */
+static void plant_forest(Chunk *c, int sx, int sy, bool event)
+{
+    bool any = false;
+    for (int my = sy * CHUNK_MH; my < (sy + 1) * CHUNK_MH && !any; my++)
+        for (int mx = sx * CHUNK_MW; mx < (sx + 1) * CHUNK_MW && !any; mx++)
+            any = kind_at(mx, my) == CELL_GROUND && tree_cell[my * EBW_MINI_W + mx];
+    if (!any) return;
+    for (int r = 1; r <= 6 && !tree_tpl_count; r++) /* find standalone trees to copy */
+        for (int dy = -r; dy <= r; dy++)
+            for (int dx = -r; dx <= r; dx++) ensure_props(sx + dx, sy + dy, event);
+    if (!tree_tpl_count) {
+        /* No tree to copy anywhere near: at least clear the canopy off the ground. */
+        Keys k;
+        for (int my = sy * CHUNK_MH; my < (sy + 1) * CHUNK_MH; my++)
+            for (int mx = sx * CHUNK_MW; mx < (sx + 1) * CHUNK_MW; mx++)
+                if (kind_at(mx, my) == CELL_GROUND && tree_cell[my * EBW_MINI_W + mx] &&
+                    ground_keys(mx - 3, mx + 3, my, my, event, &k))
+                    for (int i = 0; i < 64; i++) patch_floor(mx * 8 + (i & 7), my * 8 + (i >> 3), k.c[0], event);
+        return;
+    }
+    for (int my = sy * CHUNK_MH; my < (sy + 1) * CHUNK_MH; my++)
+        for (int mx = sx * CHUNK_MW; mx < (sx + 1) * CHUNK_MW; mx++) {
+            int ci = my * EBW_MINI_W + mx;
+            if (kind_at(mx, my) != CELL_GROUND || !tree_cell[ci]) continue;
+            unsigned hsh = (unsigned)(mx * 73856093) ^ (unsigned)(my * 19349663);
+            const TreeTemplate *t = &tree_tpl[hsh % tree_tpl_count];
+            for (int i = 0; i < 64; i++) patch_floor(mx * 8 + (i & 7), my * 8 + (i >> 3), t->ground, event);
+            if (mx % 3 || my % 3) continue;
+            Prop p = {0};
+            p.src = t->src;
+            p.w = t->w;
+            p.h = t->h;
+            p.x = mx + 0.5f + (float)((hsh >> 8) % 100) / 100.0f - 0.5f;
+            p.z = my + 0.5f + (float)((hsh >> 16) % 100) / 100.0f - 0.5f;
+            p.y = ground_at(mx, my);
+            chunk_add_prop(c, p);
+        }
+}
 
 /* Cuts out the props whose base lies in this chunk. Their canopies can reach into the chunk to
  * the north, so a chunk's floor is built only after its southern neighbours have run this. */
@@ -759,7 +1308,8 @@ static void ensure_props(int sx, int sy, bool event)
             if (id < 0) continue;
             Object *o = &objects[id];
             Prop p;
-            bool building = !o->indoors && !o->is_prop && !o->foliage && !o->forest && !o->terrain;
+            bool building = !o->indoors && !o->is_prop && !o->foliage && !o->forest && !o->terrain && !o->cliff &&
+                            !o->voidc;
             if (building) {
                 /* Its art now stands up as walls: wipe the copy painted on the ground behind it. */
                 if (o->erased || my != o->y1) continue;
@@ -783,6 +1333,11 @@ static void ensure_props(int sx, int sy, bool event)
                 }
                 continue;
             }
+            if (o->cliff || o->voidc) continue;
+            if (o->thin && !o->green && (!o->is_prop || o->cells >= 4)) {
+                add_fence_cell(c, id, mx, my, event);
+                continue;
+            }
             if (o->foliage && !o->is_prop) {
                 /* Each column of a grove stands up as its own strip at the bottom of its run. */
                 if (object_at(mx, my + 1) == id || !make_strip(id, mx, my, event, &p)) continue;
@@ -790,6 +1345,12 @@ static void ensure_props(int sx, int sy, bool event)
                 /* The first chunk to reach the object's bottom row cuts it out. */
                 if (!o->is_prop || o->prop_made || my != o->y1) continue;
                 o->prop_made = true;
+                /* Ground decorations (crater rims, manholes, flowerbeds) have nothing standing above
+                 * them: they stay painted on the floor. */
+                if (!owns_art_above(id, o) && !o->green) {
+                    o->hidden = true;
+                    continue;
+                }
                 if (!make_prop(o, event, &p)) {
                     /* Nothing but ground colours: an invisible blocker. Draw nothing. */
                     o->hidden = true;
@@ -799,6 +1360,7 @@ static void ensure_props(int sx, int sy, bool event)
             c->props = realloc(c->props, sizeof(Prop) * (c->nprops + 1));
             c->props[c->nprops++] = p;
         }
+    plant_forest(c, sx, sy, event);
 }
 
 typedef struct {
@@ -807,6 +1369,8 @@ typedef struct {
     unsigned short *idx;
     int verts, tris, cap_v, cap_t;
 } MeshBuf;
+
+static float mb_yoff; /* raises whatever is being emitted onto its ground height */
 
 static void mb_quad(MeshBuf *m, Vector3 a, Vector3 b, Vector3 c, Vector3 d, UvRect uv, unsigned char shade)
 {
@@ -827,7 +1391,7 @@ static void mb_quad(MeshBuf *m, Vector3 a, Vector3 b, Vector3 c, Vector3 d, UvRe
     for (int i = 0; i < 4; i++) {
         int v = m->verts + i;
         m->pos[v * 3] = p[i].x;
-        m->pos[v * 3 + 1] = p[i].y;
+        m->pos[v * 3 + 1] = p[i].y + mb_yoff;
         m->pos[v * 3 + 2] = p[i].z;
         m->uv[v * 2] = uvs[i][0];
         m->uv[v * 2 + 1] = uvs[i][1];
@@ -844,6 +1408,10 @@ static void mb_quad(MeshBuf *m, Vector3 a, Vector3 b, Vector3 c, Vector3 d, UvRe
 
 static int floor_slot(int tx, int ty, bool event)
 {
+    if (tx < 0) tx = 0;
+    if (ty < 0) ty = 0;
+    if (tx >= EBW_MAP_W) tx = EBW_MAP_W - 1;
+    if (ty >= EBW_MAP_H) ty = EBW_MAP_H - 1;
     uint32_t *patch = floor_patch[event ? 1 : 0][ty * EBW_MAP_W + tx];
     if (!patch) return atlas_slot(tx, ty, event);
     int32_t *cached = &slot_of_cleaned[(event ? MAP_TILES : 0) + ty * EBW_MAP_W + tx];
@@ -869,7 +1437,7 @@ static float cell_height(int mx, int my, bool facades)
     int id = object_at(mx, my);
     if (id < 0) return 0;
     const Object *o = &objects[id];
-    if (o->is_prop || o->foliage || o->hidden) return 0;
+    if (o->is_prop || o->foliage || o->hidden || o->cliff || o->voidc) return 0;
     if (o->shaped && facades) return 0; /* drawn as a whole model by emit_building */
     int levels = o->levels;
     if (o->terrain || o->forest) levels = tree_cell[my * EBW_MINI_W + mx] ? FOREST_LEVELS : TERRAIN_LEVELS;
@@ -982,11 +1550,65 @@ static void build_chunk(int sx, int sy, const W3dOptions *opt)
         for (int dx = -1; dx <= 1; dx++) ensure_props(sx + dx, sy + dy, event);
 
     MeshBuf m = {0};
-    for (int ty = sy * EBW_SECTOR_H; ty < (sy + 1) * EBW_SECTOR_H; ty++)
-        for (int tx = sx * EBW_SECTOR_W; tx < (sx + 1) * EBW_SECTOR_W; tx++) {
-            float x0 = tx * 4.0f, z0 = ty * 4.0f;
-            mb_quad(&m, (Vector3){x0, 0, z0}, (Vector3){x0 + 4, 0, z0}, (Vector3){x0 + 4, 0, z0 + 4},
-                    (Vector3){x0, 0, z0 + 4}, slot_uv(floor_slot(tx, ty, event), 0, 0, 32, 32), 255);
+    mb_yoff = 0;
+    /* Ground: one quad per minitile on the solved height field. Cliff cells show the ground
+     * above them (their top); their faces drop to the ground below. The off-map sky isn't drawn. */
+    for (int my = sy * CHUNK_MH; my < (sy + 1) * CHUNK_MH; my++)
+        for (int mx = sx * CHUNK_MW; mx < (sx + 1) * CHUNK_MW; mx++) {
+            int kind = kind_at(mx, my);
+            if (kind == CELL_VOID) continue;
+            float own = ground_at(mx, my);
+            float h00 = corner_height(mx, my, kind, own), h10 = corner_height(mx + 1, my, kind, own);
+            float h11 = corner_height(mx + 1, my + 1, kind, own), h01 = corner_height(mx, my + 1, kind, own);
+            float x = (float)mx, z = (float)my;
+            UvRect uv;
+            if (kind == CELL_CLIFF) {
+                int top = my;
+                while (kind_at(mx, top - 1) == CELL_CLIFF) top--;
+                /* Plain ground from the terrace above (past the dark lip drawn along the edge). */
+                int gy = top > 0 ? top - 1 : 0;
+                for (int up = 1; up <= 5; up++) {
+                    int yy = top - up;
+                    if (kind_at(mx, yy) != CELL_GROUND) break;
+                    if (object_at(mx, yy) < 0 && !ebw_foreground_at(mx, yy)) gy = yy;
+                    if (up >= 3 && gy != top - 1) break;
+                }
+                uv = slot_uv(floor_slot(mx >> 2, gy >> 2, event), (mx & 3) * 8, (gy & 3) * 8, 8, 8);
+            } else {
+                uv = slot_uv(floor_slot(mx >> 2, my >> 2, event), (mx & 3) * 8, (my & 3) * 8, 8, 8);
+            }
+            mb_quad(&m, (Vector3){x, h00, z}, (Vector3){x + 1, h10, z}, (Vector3){x + 1, h11, z + 1},
+                    (Vector3){x, h01, z + 1}, uv, 255);
+
+            if (kind != CELL_CLIFF) continue;
+            /* Faces where the neighbouring ground is lower: the cliff's own art, stood up. */
+            int bot = my, top = my;
+            while (kind_at(mx, bot + 1) == CELL_CLIFF) bot++;
+            while (kind_at(mx, top - 1) == CELL_CLIFF) top--;
+            int L = bot - top + 1;
+            const int nb[4][2] = {{0, 1}, {0, -1}, {1, 0}, {-1, 0}};
+            for (int f = 0; f < 4; f++) {
+                int nx = mx + nb[f][0], ny = my + nb[f][1];
+                if (kind_at(nx, ny) != CELL_GROUND) continue;
+                /* Edge endpoints (a then b, seen from outside) and their heights on both sides. */
+                int ax, az, bx, bz;
+                if (f == 0) ax = mx, az = my + 1, bx = mx + 1, bz = my + 1;
+                else if (f == 1) ax = mx + 1, az = my, bx = mx, bz = my;
+                else if (f == 2) ax = mx + 1, az = my + 1, bx = mx + 1, bz = my;
+                else ax = mx, az = my, bx = mx, bz = my + 1;
+                float ha = corner_height(ax, az, CELL_CLIFF, own), hb = corner_height(bx, bz, CELL_CLIFF, own);
+                float la = corner_height(ax, az, CELL_GROUND, ground_at(nx, ny));
+                float lb = corner_height(bx, bz, CELL_GROUND, ground_at(nx, ny));
+                if (ha - la < 0.05f && hb - lb < 0.05f) continue;
+                for (int k = 0; k < L; k++) {
+                    float t0 = (float)k / L, t1 = (float)(k + 1) / L;
+                    UvRect fuv = minitile_uv(mx, rock_row(mx, top, bot, bot - k, event), event);
+                    mb_quad(&m, (Vector3){(float)ax, la + (ha - la) * t1, (float)az},
+                            (Vector3){(float)bx, lb + (hb - lb) * t1, (float)bz},
+                            (Vector3){(float)bx, lb + (hb - lb) * t0, (float)bz},
+                            (Vector3){(float)ax, la + (ha - la) * t0, (float)az}, fuv, f == 0 ? 225 : f == 1 ? 150 : 190);
+                }
+            }
         }
 
     /* Whole-model buildings, emitted by the chunk holding their bottom-left corner. */
@@ -999,7 +1621,10 @@ static void build_chunk(int sx, int sy, const W3dOptions *opt)
                 Object *o = &objects[id];
                 if (!o->shaped || o->emitted_build == build_serial || mx != o->fx || my != o->fy) continue;
                 o->emitted_build = build_serial;
+                int cx = (o->x0 + o->x1) / 2, cb = column_bottom(id, cx, o->y0, o->y1);
+                mb_yoff = ground_at(cx, cb < 0 ? o->y1 : cb);
                 emit_building(&m, id, event);
+                mb_yoff = 0;
             }
 
     for (int my = sy * CHUNK_MH; my < (sy + 1) * CHUNK_MH; my++)
@@ -1007,6 +1632,7 @@ static void build_chunk(int sx, int sy, const W3dOptions *opt)
             float h = cell_height(mx, my, facades);
             if (h <= 0) continue;
             int id = object_at(mx, my);
+            mb_yoff = ground_at(mx, my);
             float s = cell_scale(id);
             float x = (float)mx, z = (float)my;
             const Object *o = &objects[id];
@@ -1066,6 +1692,7 @@ static void build_chunk(int sx, int sy, const W3dOptions *opt)
             }
         }
 
+    mb_yoff = 0;
     Chunk *c = &chunks[sy][sx];
     c->built = true;
     c->last_used = frame_no;
@@ -1097,6 +1724,7 @@ void w3d_invalidate(void)
             Chunk *c = &chunks[y][x];
             free_chunk_mesh(c);
             free(c->props);
+            free(c->fences);
             memset(c, 0, sizeof *c);
         }
     for (int e = 0; e < 2; e++)
@@ -1111,11 +1739,13 @@ void w3d_invalidate(void)
     }
     slots_used = 0;
     shelf_x = shelf_y = shelf_h = 0;
+    tree_tpl_count = 0;
     atlas_full = false;
     if (analysed)
         for (int i = 0; i < object_count; i++) {
             objects[i].prop_made = false;
             objects[i].hidden = false;
+            objects[i].fence_made = false;
             objects[i].is_prop = looks_like_prop(&objects[i]);
         }
 }
@@ -1218,6 +1848,12 @@ void w3d_shutdown(void)
     for (int e = 0; e < 2; e++) free(floor_patch[e]);
     free(tile_cache);
     free(solid_grid);
+    free(ground);
+    free(fg_owner);
+    fg_owner = NULL;
+    free(cell_kind);
+    ground = NULL;
+    cell_kind = NULL;
     free(tree_cell);
     free(object_of);
     free(objects);
@@ -1241,8 +1877,10 @@ void w3d_class_map(const char *path, int tx, int ty, int tw, int th)
             if (id >= 0) {
                 Object *o = &objects[id];
                 bool tree = (o->terrain || o->forest) && tree_cell[(py / 8) * EBW_MINI_W + px / 8];
-                tint = o->is_prop ? 0xFF00FFFF : o->foliage ? 0xFFFFFF00 : tree ? 0xFF008000
-                     : o->terrain || o->forest ? 0xFFFF0000 : o->blueprint ? 0xFFFF00FF : 0xFF0000FF;
+                int kind = kind_at(px / 8, py / 8);
+                tint = kind == CELL_VOID ? 0xFF000000 : kind == CELL_CLIFF ? 0xFF0080FF : tree ? 0xFF008000
+                     : o->is_prop ? 0xFF00FFFF : o->foliage ? 0xFFFFFF00 : o->terrain || o->forest ? 0xFFFF0000
+                     : o->blueprint ? 0xFFFF00FF : 0xFF0000FF;
             }
             if (tint) { /* blend 50% */
                 uint32_t r = ((c & 0xFF) + (tint & 0xFF)) / 2, g = (((c >> 8) & 0xFF) + ((tint >> 8) & 0xFF)) / 2,
@@ -1253,6 +1891,19 @@ void w3d_class_map(const char *path, int tx, int ty, int tw, int th)
         }
     ExportImage(img, path);
     UnloadImage(img);
+}
+
+void w3d_dump_ground(const char *path, int tx, int ty, int tw, int th)
+{
+    if (!analysed) analyse_world();
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    for (int my = ty * 4; my < (ty + th) * 4; my++) {
+        for (int mx = tx * 4; mx < (tx + tw) * 4; mx++)
+            fprintf(f, "%s%.2f:%d", mx == tx * 4 ? "" : " ", ground_at(mx, my), kind_at(mx, my));
+        fprintf(f, "\n");
+    }
+    fclose(f);
 }
 
 void w3d_dump_objects(const char *path)
@@ -1273,6 +1924,9 @@ void w3d_dump_objects(const char *path)
 void w3d_probe(int px, int py)
 {
     if (!analysed) analyse_world();
+    TraceLog(LOG_WARNING, "probe cell %d,%d: obj %d fg %d owner %d kind %d tree %d ground %.2f", px / 8, py / 8,
+             object_at(px / 8, py / 8), ebw_foreground_at(px / 8, py / 8), owner_at(px / 8, py / 8),
+             kind_at(px / 8, py / 8), tree_cell[(py / 8) * EBW_MINI_W + px / 8], ground_at(px / 8, py / 8));
     int id = object_at(px / 8, py / 8);
     if (id < 0) {
         TraceLog(LOG_WARNING, "probe %d,%d: open ground", px, py);
@@ -1285,7 +1939,34 @@ void w3d_probe(int px, int py)
 
 bool w3d_pending(void) { return chunks_pending; }
 
+float w3d_ground(float x, float z)
+{
+    if (!analysed) analyse_world();
+    return ground_at((int)floorf(x), (int)floorf(z));
+}
+
 bool w3d_is_solid(float x, float z) { return analysed && solid((int)floorf(x), (int)floorf(z)); }
+
+static void draw_fences(const Chunk *c)
+{
+    for (int i = 0; i < c->nfences; i++) {
+        const FenceSeg *f = &c->fences[i];
+        float len = sqrtf((f->x1 - f->x0) * (f->x1 - f->x0) + (f->z1 - f->z0) * (f->z1 - f->z0));
+        int pieces = (int)(len + 0.5f);
+        if (pieces < 1) pieces = 1;
+        float u0 = f->src.x / PROP_ATLAS, v0 = f->src.y / PROP_ATLAS;
+        float u1 = (f->src.x + f->src.width) / PROP_ATLAS, v1 = (f->src.y + f->src.height) / PROP_ATLAS;
+        for (int k = 0; k < pieces; k++) {
+            float t0 = (float)k / pieces, t1 = (float)(k + 1) / pieces;
+            float ax = f->x0 + (f->x1 - f->x0) * t0, az = f->z0 + (f->z1 - f->z0) * t0, ay = f->y0 + (f->y1 - f->y0) * t0;
+            float bx = f->x0 + (f->x1 - f->x0) * t1, bz = f->z0 + (f->z1 - f->z0) * t1, by = f->y0 + (f->y1 - f->y0) * t1;
+            rlTexCoord2f(u0, v1); rlVertex3f(ax, ay, az);
+            rlTexCoord2f(u1, v1); rlVertex3f(bx, by, bz);
+            rlTexCoord2f(u1, v0); rlVertex3f(bx, by + f->h, bz);
+            rlTexCoord2f(u0, v0); rlVertex3f(ax, ay + f->h, az);
+        }
+    }
+}
 
 static void draw_props(const Chunk *c, Vector3 right)
 {
@@ -1295,10 +1976,11 @@ static void draw_props(const Chunk *c, Vector3 right)
         float u1 = (p->src.x + p->src.width) / PROP_ATLAS, v1 = (p->src.y + p->src.height) / PROP_ATLAS;
         float hw = p->w * 0.5f * OUTDOOR_SCALE, h = p->h * OUTDOOR_SCALE;
         Vector3 l = {p->x - right.x * hw, 0, p->z - right.z * hw}, r = {p->x + right.x * hw, 0, p->z + right.z * hw};
-        rlTexCoord2f(u0, v1); rlVertex3f(l.x, 0, l.z);
-        rlTexCoord2f(u1, v1); rlVertex3f(r.x, 0, r.z);
-        rlTexCoord2f(u1, v0); rlVertex3f(r.x, h, r.z);
-        rlTexCoord2f(u0, v0); rlVertex3f(l.x, h, l.z);
+        float y0 = p->y, y1 = p->y + h;
+        rlTexCoord2f(u0, v1); rlVertex3f(l.x, y0, l.z);
+        rlTexCoord2f(u1, v1); rlVertex3f(r.x, y0, r.z);
+        rlTexCoord2f(u1, v0); rlVertex3f(r.x, y1, r.z);
+        rlTexCoord2f(u0, v0); rlVertex3f(l.x, y1, l.z);
     }
 }
 
@@ -1367,7 +2049,10 @@ void w3d_draw(Camera3D cam, const W3dOptions *opt)
     rlSetTexture(prop_atlas.id);
     rlBegin(RL_QUADS);
     rlColor4ub(255, 255, 255, 255);
-    for (int i = 0; i < nvisible; i++) draw_props(visible[i], right);
+    for (int i = 0; i < nvisible; i++) {
+        draw_props(visible[i], right);
+        draw_fences(visible[i]);
+    }
     rlEnd();
     rlSetTexture(0);
     EndShaderMode();

@@ -8,3 +8,4 @@ roms/
 build/
 out/
 *.bps.tmp
+build-*/

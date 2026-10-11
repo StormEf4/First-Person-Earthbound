@@ -334,6 +334,7 @@ int main(int argc, char **argv)
     int probe[16][2], nprobe = 0;    /* --probe px py: log the object there */
     const char *class_map = NULL;    /* --class-map file tx ty tw th */
     const char *dump_objects = NULL; /* --dump-objects file.csv */
+    const char *dump_ground = NULL;  /* --dump-ground file: heights for the house area */
     const char *shot_list = NULL;    /* --shot-list file: lines "out.png px py yaw pitch [height]" */
     int class_rect[4] = {0};
 
@@ -354,6 +355,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--cam-y") && i + 1 < argc) cam_y = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--shot-list") && i + 1 < argc) shot_list = argv[++i];
         else if (!strcmp(argv[i], "--dump-objects") && i + 1 < argc) dump_objects = argv[++i];
+        else if (!strcmp(argv[i], "--dump-ground") && i + 1 < argc) dump_ground = argv[++i];
         else if (!strcmp(argv[i], "--class-map") && i + 5 < argc) {
             class_map = argv[++i];
             for (int k = 0; k < 4; k++) class_rect[k] = atoi(argv[++i]);
@@ -387,6 +389,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < nprobe && world_ok; i++) w3d_probe(probe[i][0], probe[i][1]);
     if (class_map && world_ok) w3d_class_map(class_map, class_rect[0], class_rect[1], class_rect[2], class_rect[3]);
     if (dump_objects && world_ok) w3d_dump_objects(dump_objects);
+    if (dump_ground && world_ok) w3d_dump_ground(dump_ground, 60, 0, 26, 20);
     if (shot_list && world_ok) {
         /* Reference-photo batch: one process renders many camera positions. */
         FILE *f = fopen(shot_list, "r");

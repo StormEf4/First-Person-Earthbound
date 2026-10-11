@@ -45,6 +45,7 @@ void viewer_config_write(FILE *f)
 void viewer_place(float px, float py, int direction)
 {
     pos = (Vector3){px / 8.0f, EYE_HEIGHT, py / 8.0f};
+    pos.y = w3d_ground(pos.x, pos.z) + EYE_HEIGHT;
     yaw = (direction >= 0 && direction < 8) ? direction * PI / 4 : 0;
     pitch = 0;
 }
@@ -55,7 +56,7 @@ void viewer_set_angles(float yaw_deg, float pitch_deg)
     pitch = pitch_deg * DEG2RAD;
 }
 
-void viewer_set_height(float units) { pos.y = units; }
+void viewer_set_height(float units) { pos.y = w3d_ground(pos.x, pos.z) + units; /* above the ground */ }
 
 void viewer_set_option(int id, int value)
 {
@@ -131,7 +132,8 @@ bool viewer_update(float dt)
     }
     if (Vector3Length(move) > 1) move = Vector3Normalize(move);
     pos = Vector3Add(pos, Vector3Scale(move, speed));
-    if (pos.y < 0.5f) pos.y = 0.5f;
+    float floor_y = w3d_ground(pos.x, pos.z) + 0.5f;
+    if (pos.y < floor_y) pos.y = floor_y;
     pitch = Clamp(pitch, -1.4f, 1.4f);
     return changed;
 }
