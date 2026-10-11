@@ -181,6 +181,7 @@ typedef struct {
 } Object;
 
 static bool looks_like_prop(const Object *o);
+static int building_depth(const Object *o);
 
 static uint8_t *solid_grid;
 static uint8_t *tree_cell; /* in cliff/forest masses: this cell's art is tree canopy */
@@ -771,7 +772,7 @@ static void ensure_props(int sx, int sy, bool event)
                     int top = base;
                     while (object_at(cx, top - 1) == id) top--;
                     int extra = art_rows_above(id, cx, base, &keys, event);
-                    int erase_to = o->shaped ? base - o->roof_rows : top - 1; /* behind the footprint */
+                    int erase_to = o->shaped ? base - building_depth(o) : top - 1; /* behind the footprint */
                     int erase_from = top - extra;
                     if (o->shaped && base - o->levels + 1 < erase_from) erase_from = base - o->levels + 1;
                     for (int ry = erase_from; ry <= erase_to; ry++)
@@ -890,22 +891,33 @@ static void tri(MeshBuf *m, Vector3 a, Vector3 b, Vector3 c, UvRect uv, unsigned
     mb_quad(m, a, b, c, c, uv, shade); /* degenerate quad */
 }
 
-/* A shaped building as one model: walls of wall_rows levels on a footprint roof_rows deep, topped
- * by a pitched (gable) or flat roof wearing the roof art. */
+/* Depth of a shaped building in cells: its roof rows, but at least half its wall height (a tall
+ * downtown block draws only a thin strip of roof), and no deeper than its solid footprint. */
+static int building_depth(const Object *o)
+{
+    int d = o->roof_rows, half = o->wall_rows / 2;
+    if (half > d) d = half;
+    int span = o->y1 - o->y0 + 1;
+    if (d > span) d = span > o->roof_rows ? span : o->roof_rows;
+    return d < 1 ? 1 : d;
+}
+
+/* A shaped building as one model: walls of wall_rows levels on a footprint building_depth deep,
+ * topped by a pitched (gable) or flat roof wearing the roof art. */
 static void emit_building(MeshBuf *m, int id, bool event)
 {
     const Object *o = &objects[id];
     float s = OUTDOOR_SCALE;
-    int W = o->wall_rows, R = o->roof_rows;
-    float yw = W * s, yr = yw + (o->gable ? R * 0.5f * s : 0);
+    int W = o->wall_rows, R = o->roof_rows, D = building_depth(o);
+    float yw = W * s, yr = yw + (o->gable ? D * 0.5f * s : 0);
     for (int mx = o->x0; mx <= o->x1; mx++) {
         int base = column_bottom(id, mx, o->y0, o->y1);
         if (base < 0) continue;
-        float x = (float)mx, zf = base + 1.0f, zb = zf - R, zr = (zf + zb) * 0.5f;
-        bool west_open = column_bottom(id, mx - 1, o->y0, o->y1) < 0;
-        bool east_open = column_bottom(id, mx + 1, o->y0, o->y1) < 0;
-        /* Siding for ends and back: an inner column's wall art. */
-        int inner = west_open ? mx + 1 : east_open ? mx - 1 : mx;
+        float x = (float)mx, zf = base + 1.0f, zb = zf - D, zr = (zf + zb) * 0.5f;
+        /* Neighbouring columns' footprints, to close the sides where they don't cover ours. */
+        int nb_w = column_bottom(id, mx - 1, o->y0, o->y1), nb_e = column_bottom(id, mx + 1, o->y0, o->y1);
+        float wf = nb_w < 0 ? -1e9f : nb_w + 1.0f, ef = nb_e < 0 ? -1e9f : nb_e + 1.0f;
+        int inner = nb_w < 0 ? mx + 1 : nb_e < 0 ? mx - 1 : mx;
         int inner_base = column_bottom(id, inner, o->y0, o->y1);
         if (inner_base < 0) {
             inner = mx;
@@ -919,28 +931,33 @@ static void emit_building(MeshBuf *m, int id, bool event)
                     front, 230);
             mb_quad(m, (Vector3){x + 1, yb, zb}, (Vector3){x, yb, zb}, (Vector3){x, ya, zb}, (Vector3){x + 1, ya, zb},
                     siding, 150);
-            for (int j = 0; j < R; j++) {
+            for (int j = 0; j < D; j++) {
                 float za = zb + j, zc = zb + j + 1;
-                if (west_open)
+                /* A side slice shows unless the neighbour's footprint covers it. */
+                bool w_covered = za >= wf - D - 0.01f && zc <= wf + 0.01f;
+                bool e_covered = za >= ef - D - 0.01f && zc <= ef + 0.01f;
+                if (!w_covered)
                     mb_quad(m, (Vector3){x, yb, za}, (Vector3){x, yb, zc}, (Vector3){x, ya, zc}, (Vector3){x, ya, za},
                             siding, 190);
-                if (east_open)
+                if (!e_covered)
                     mb_quad(m, (Vector3){x + 1, yb, zc}, (Vector3){x + 1, yb, za}, (Vector3){x + 1, ya, za},
                             (Vector3){x + 1, ya, zc}, siding, 190);
             }
         }
-        /* Gable ends: triangles of siding under the roof. */
+        /* Gable ends: triangles of siding under the roof, where no neighbour continues it. */
         if (o->gable) {
             UvRect siding = minitile_uv(inner, inner_base - W + 1, event);
-            if (west_open) tri(m, (Vector3){x, yw, zb}, (Vector3){x, yw, zf}, (Vector3){x, yr, zr}, siding, 185);
-            if (east_open) tri(m, (Vector3){x + 1, yw, zf}, (Vector3){x + 1, yw, zb}, (Vector3){x + 1, yr, zr}, siding, 185);
+            if (nb_w < 0 || nb_w != base)
+                tri(m, (Vector3){x, yw, zb}, (Vector3){x, yw, zf}, (Vector3){x, yr, zr}, siding, 185);
+            if (nb_e < 0 || nb_e != base)
+                tri(m, (Vector3){x + 1, yw, zf}, (Vector3){x + 1, yw, zb}, (Vector3){x + 1, yr, zr}, siding, 185);
         }
-        /* Roof: the art rows above the wall, eave first. */
+        /* Roof: the art rows above the wall, eave first, stretched over the depth. */
         for (int j = 0; j < R; j++) {
             UvRect uv = minitile_uv(mx, base - W - j, event);
+            float t0 = (float)j / R, t1 = (float)(j + 1) / R;
             if (o->gable) {
                 /* Front slope climbs from the front eave to the ridge; the back slope mirrors it. */
-                float t0 = (float)j / R, t1 = (float)(j + 1) / R;
                 float fz0 = zf + (zr - zf) * t0, fz1 = zf + (zr - zf) * t1;
                 float bz0 = zb + (zr - zb) * t0, bz1 = zb + (zr - zb) * t1;
                 float y0 = yw + (yr - yw) * t0, y1 = yw + (yr - yw) * t1;
@@ -949,7 +966,7 @@ static void emit_building(MeshBuf *m, int id, bool event)
                 mb_quad(m, (Vector3){x + 1, y1, bz1}, (Vector3){x, y1, bz1}, (Vector3){x, y0, bz0},
                         (Vector3){x + 1, y0, bz0}, uv, 170);
             } else {
-                float za = zf - j - 1, zc = zf - j;
+                float za = zf - D * t1, zc = zf - D * t0;
                 mb_quad(m, (Vector3){x, yw, za}, (Vector3){x + 1, yw, za}, (Vector3){x + 1, yw, zc},
                         (Vector3){x, yw, zc}, uv, 235);
             }
@@ -1243,11 +1260,12 @@ void w3d_dump_objects(const char *path)
     if (!analysed) analyse_world();
     FILE *f = fopen(path, "w");
     if (!f) return;
-    fprintf(f, "id,x0,y0,x1,y1,cells,levels,prop,foliage,forest,terrain,indoors,blueprint\n");
+    fprintf(f, "id,x0,y0,x1,y1,cells,levels,prop,foliage,forest,terrain,indoors,blueprint,shaped,gable,wall,roof,thin\n");
     for (int i = 0; i < object_count; i++) {
         Object *o = &objects[i];
-        fprintf(f, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n", i, o->x0, o->y0, o->x1, o->y1, o->cells, o->levels,
-                o->is_prop, o->foliage, o->forest, o->terrain, o->indoors, o->blueprint);
+        fprintf(f, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n", i, o->x0, o->y0, o->x1, o->y1, o->cells,
+                o->levels, o->is_prop, o->foliage, o->forest, o->terrain, o->indoors, o->blueprint, o->shaped, o->gable,
+                o->wall_rows, o->roof_rows, o->thin);
     }
     fclose(f);
 }

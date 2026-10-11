@@ -111,4 +111,5 @@ Q1–Q13 are answered (D3–D12, D17–D19). Still open:
   - Fences get loose ground keying, thin cells always become strips, and the ground sample never takes leafy cells (single-cell trunks were losing their canopies).
   - Art-less blocker cells are hidden.
   - Verified with full reference passes.
+  - Building depth = max(roof rows, wall/2), capped by the solid footprint (`building_depth`). Side walls are drawn wherever a neighbouring column's footprint doesn't cover the slice, so staggered blocks like the motel close up instead of showing slivers.
   - Known leftovers: hills aren't raised plateaus (cliffs are 2-level ledges); forest masses are flat-topped walls; an odd striped tall object near (1000,1470).
