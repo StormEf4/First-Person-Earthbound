@@ -219,6 +219,16 @@ uint8_t ebw_collision_at(int mx, int my)
     return t ? t->collision[map_tiles[ty][tx]][(my & 3) * 4 + (mx & 3)] : 0;
 }
 
+bool ebw_foreground_at(int mx, int my)
+{
+    int tx = mx >> 2, ty = my >> 2;
+    if (!in_map(tx, ty)) return false;
+    GfxTileset *t = load_gfx(map_to_gfx[ebw_tileset_at(tx, ty)]);
+    if (!t) return false;
+    /* EarthBound marks walk-behind cells in collision: they hide part of Ness's sprite. */
+    return (t->collision[map_tiles[ty][tx]][(my & 3) * 4 + (mx & 3)] & (EBW_OBSCURE_LOWER | EBW_OBSCURE_UPPER)) != 0;
+}
+
 static size_t palette_offset(int map_tileset, int palette, bool event_palette)
 {
     size_t off = snes_to_file(rd32(PALETTE_POINTERS + (map_tileset & 31) * 4)) + (size_t)palette * PALETTE_BYTES;

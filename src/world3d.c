@@ -21,6 +21,18 @@ static bool ground_keys_pct(int x0, int x1, int y0, int y1, bool event, Keys *ke
 
 static int art_rows_above(int id, int mx, int base, const Keys *keys, bool event);
 static int column_bottom(int id, int mx, int y0, int y1);
+static void detect_shape(int id, int W, int R);
+
+static int median(int *v, int n)
+{
+    for (int a = 1; a < n; a++)
+        for (int b = a; b > 0 && v[b] < v[b - 1]; b--) {
+            int t = v[b];
+            v[b] = v[b - 1];
+            v[b - 1] = t;
+        }
+    return v[n / 2];
+}
 
 /* ---- options ---- */
 
@@ -155,8 +167,16 @@ typedef struct {
     bool foliage; /* trees and hedges: drawn as cut-out strips, never as boxes */
     bool terrain; /* cliffs and ledges: long, sprawling, and kept low */
     bool forest;  /* big masses of trees: a solid wall of tree art */
+    bool thin;    /* fences and railings: cut out with every ground colour removed */
+    bool hidden;  /* nothing to show (an invisible blocker with only ground art) */
     bool blueprint; /* a hand-placed building (blueprints.c): never reclassified */
     bool erased;    /* its art above the footprint has been wiped from the floor */
+    /* Shaped buildings: the bottom wall_rows of the art are the front wall, the top roof_rows are
+     * the roof seen from above, which is also the building's depth. */
+    bool shaped, gable;
+    int wall_rows, roof_rows;
+    int emitted_build;
+    int fx, fy; /* first cell in raster order: the chunk holding it emits whole-object models */
     int levels;
 } Object;
 
@@ -212,6 +232,8 @@ static void analyse_world(void)
                 o->x0 = o->y0 = 1 << 30;
                 o->blueprint = true;
                 o->levels = bp->levels;
+                o->fx = x;
+                o->fy = y;
                 int sp = 0;
                 stack[sp++] = start;
                 object_of[start] = object_count;
@@ -260,6 +282,9 @@ static void analyse_world(void)
         Object *o = &objects[object_count];
         memset(o, 0, sizeof *o);
         o->x0 = o->y0 = 1 << 30;
+        o->fx = start % EBW_MINI_W;
+        o->fy = start / EBW_MINI_W;
+        o->thin = !bulky[start]; /* fences, hedges, trunks: never part of a solid 3x3 block */
         int sp = 0;
         stack[sp++] = start;
         object_of[start] = object_count;
@@ -339,7 +364,8 @@ static void analyse_world(void)
         int w = o->x1 - o->x0 + 1, h = o->y1 - o->y0 + 1;
         /* Thin outdoor things (fences, railings) are cut out column by column like foliage, so
          * the gaps between pickets show through. */
-        bool thin = !o->indoors && !o->is_prop && (w <= 2 || h <= 2);
+        bool thin = !o->indoors && !o->is_prop && (o->thin || w <= 2 || h <= 2);
+        o->thin = thin;
         bool green_art = total[i] && green[i] * 10 >= total[i] * 6;
         o->forest = green_art && !thin && o->cells > 60;
         o->foliage = thin || (green_art && !o->forest);
@@ -381,23 +407,20 @@ static void analyse_world(void)
         if (o->blueprint && o->levels > 0) continue;
         Keys keys;
         if (!ground_keys(o->x0, o->x1, o->y0, o->y1, false, &keys)) continue;
-        int heights[512], nh = 0;
+        int walls[512], roofs[512], nh = 0;
         for (int mx = o->x0; mx <= o->x1 && nh < 512; mx++) {
             int base = column_bottom(i, mx, o->y0, o->y1);
             if (base < 0) continue;
             int top = base;
             while (object_at(mx, top - 1) == i) top--;
-            heights[nh++] = (base - top + 1) + art_rows_above(i, mx, base, &keys, false);
+            walls[nh] = base - top + 1;
+            roofs[nh++] = art_rows_above(i, mx, base, &keys, false);
         }
         if (!nh) continue;
-        for (int a = 1; a < nh; a++) /* insertion sort for the median */
-            for (int b = a; b > 0 && heights[b] < heights[b - 1]; b--) {
-                int t = heights[b];
-                heights[b] = heights[b - 1];
-                heights[b - 1] = t;
-            }
-        int lv = heights[nh / 2];
+        int W = median(walls, nh), R = median(roofs, nh);
+        int lv = W + R;
         o->levels = lv < 2 ? 2 : lv > OUTDOOR_MAX_LEVELS ? OUTDOOR_MAX_LEVELS : lv;
+        detect_shape(i, W, R);
     }
     free(stack);
     analysed = true;
@@ -410,20 +433,19 @@ static bool looks_like_prop(const Object *o)
     return w <= 6 && h <= 6 && o->cells <= 30 && !o->indoors;
 }
 
-/* How many rows of a building's art rise above its footprint in column mx: open cells directly
- * above the run ending at `base` that are mostly not ground colour. That art is the part of the
- * building drawn "upwards" by the oblique view, i.e. its height. */
+/* How many rows of art stand above the solid run ending at `base` in column mx: the walk-behind
+ * cells directly above it (a roof, a canopy, a sign's board). */
 static int art_rows_above(int id, int mx, int base, const Keys *keys, bool event)
 {
     int top = base;
     while (object_at(mx, top - 1) == id) top--;
+    (void)keys;
+    (void)event;
+    /* The game marks the cells Ness walks behind (they hide part of his sprite): exactly the art
+     * standing above a footprint. Roads and lawns behind a building are never marked. */
     int extra = 0;
     for (int my = top - 1; my >= top - 16 && my >= 0; my--) {
-        if (object_at(mx, my) != -1) break;
-        int art = 0;
-        for (int i = 0; i < 64; i++)
-            if (!is_key(keys, pixel_at(mx * 8 + (i & 7), my * 8 + (i >> 3), event))) art++;
-        if (art < 16) break;
+        if (object_at(mx, my) != -1 || !ebw_foreground_at(mx, my)) break;
         extra++;
     }
     return extra;
@@ -434,6 +456,48 @@ static int column_bottom(int id, int mx, int y0, int y1)
     for (int my = y1; my >= y0; my--)
         if (object_at(mx, my) == id) return my;
     return -1;
+}
+
+/* A building's solid rows are its front wall; the walk-behind rows above are its roof seen from
+ * above, which is also its depth. Bright, saturated roofs are pitched; pale ones are flat. */
+static void detect_shape(int id, int W, int R)
+{
+    Object *o = &objects[id];
+    o->shaped = W >= 2 && R >= 2;
+    o->gable = false;
+    if (!o->shaped) return;
+    o->wall_rows = W;
+    o->roof_rows = R;
+    if (R < 3) return;
+    uint32_t pal[48];
+    int cnt[48], np = 0, best = -1;
+    for (int mx = o->x0; mx <= o->x1; mx++) {
+        int base = column_bottom(id, mx, o->y0, o->y1);
+        if (base < 0) continue;
+        for (int j = 0; j < R; j++)
+            for (int i = 0; i < 64; i += 3) {
+                uint32_t c = pixel_at(mx * 8 + (i & 7), (base - W - j) * 8 + (i >> 3), false);
+                int cr = c & 0xFF, cg = (c >> 8) & 0xFF, cb = (c >> 16) & 0xFF;
+                if (cr < 70 && cg < 70 && cb < 70) continue;
+                int k = 0;
+                while (k < np && pal[k] != c) k++;
+                if (k == np) {
+                    if (np == 48) continue;
+                    pal[np] = c;
+                    cnt[np++] = 0;
+                }
+                cnt[k]++;
+            }
+    }
+    for (int k = 0; k < np; k++)
+        if (best < 0 || cnt[k] > cnt[best]) best = k;
+    if (best < 0) return;
+    uint32_t d = pal[best];
+    int dr = d & 0xFF, dg = (d >> 8) & 0xFF, db = (d >> 16) & 0xFF;
+    int hi = dr > dg ? (dr > db ? dr : db) : (dg > db ? dg : db), lo = dr < dg ? (dr < db ? dr : db) : (dg < db ? dg : db);
+    bool greenish = dg > dr + 16 && dg >= db; /* grassy cliff lips are not roofs */
+    o->gable = hi - lo >= 60 && !greenish;
+    if (greenish) o->shaped = false;
 }
 
 /* ---- props: small objects as camera-facing cut-outs ---- */
@@ -491,8 +555,10 @@ static bool ground_keys_pct(int x0, int x1, int y0, int y1, bool event, Keys *ke
     int counts[32], ncol = 0, total = 0;
     for (int my = y0; my <= y1 + 2; my++)
         for (int mx = x0 - 2; mx <= x1 + 2; mx++) {
-            bool below = my > y1, beside = mx < x0 || mx > x1;
+            bool below = my > y1, beside = (mx < x0 || mx > x1) && my == y1;
             if (!(below || beside) || solid(mx, my)) continue;
+            /* Never sample leaves: walk-behind cells and the canopy rows just under them. */
+            if (ebw_foreground_at(mx, my) || ebw_foreground_at(mx, my - 1) || ebw_foreground_at(mx, my - 2)) continue;
             for (int i = 0; i < 64; i++) {
                 uint32_t c = pixel_at(mx * 8 + (i & 7), my * 8 + (i >> 3), event);
                 int k = 0;
@@ -524,12 +590,31 @@ static bool ground_keys_pct(int x0, int x1, int y0, int y1, bool event, Keys *ke
     return keys->n > 0;
 }
 
+/* Mostly green art in the walk-behind cells of a window: a tree or bush rather than a sign. */
+static bool is_leafy(int id, int wx0, int wy0, int ww, int wh, bool event)
+{
+    (void)id;
+    int green = 0, lit = 0;
+    for (int y = 0; y < wh; y += 2)
+        for (int x = 0; x < ww; x += 2) {
+            int px = wx0 + x, py = wy0 + y;
+            if (px < 0 || py < 0 || !ebw_foreground_at(px >> 3, py >> 3)) continue;
+            uint32_t c = pixel_at(px, py, event);
+            int r = c & 0xFF, g = (c >> 8) & 0xFF, b = (c >> 16) & 0xFF;
+            if (r < 70 && g < 70 && b < 70) continue;
+            lit++;
+            if (g > r + 16 && g >= b) green++;
+        }
+    return lit && green * 2 >= lit;
+}
+
 /* Cuts an object's art out of a pixel window of the map: its own pixels plus everything drawn
  * connected to them (a tree's canopy), minus the ground colours. The cut-out pixels are erased
  * from the floor. The sprite stands at depth z. False if nothing could be cut. */
 static bool cut_out(int id, int wx0, int wy0, int ww, int wh, const Keys *keys, const Keys *base_keys,
                     int base_py, int open_max_py, bool event, float z, Prop *out)
 {
+    bool leafy = is_leafy(id, wx0, wy0, ww, wh, event);
     enum { MAXW = 96, MAXH = 128 };
     if (ww > MAXW || wh > MAXH || ww <= 0 || wh <= 0) return false;
     static uint32_t win[MAXW * MAXH];
@@ -547,7 +632,18 @@ static bool cut_out(int id, int wx0, int wy0, int ww, int wh, const Keys *keys, 
             /* Around the base, shadows are painted in colours the canopy also uses; there a wider
              * set of ground colours applies. */
             const Keys *k = py >= base_py ? base_keys : keys;
-            bool allowed = (obj == id || (obj == -1 && py < open_max_py)) && !is_key(k, c);
+            /* Open ground only counts where the game draws it in front of Ness (a canopy, a sign's
+             * board), so neighbouring roads and lawns never get dragged in. */
+            bool fg = false;
+            if (obj == -1 && px >= 0 && py >= 0) {
+                int cx = px >> 3, cy = py >> 3;
+                fg = ebw_foreground_at(cx, cy);
+                /* Leafy things: the game marks only the upper canopy as walk-behind; the rows just
+                 * below it, down to the trunk, are canopy too. */
+                if (!fg && leafy && py < open_max_py)
+                    fg = ebw_foreground_at(cx, cy - 1) || ebw_foreground_at(cx, cy - 2);
+            }
+            bool allowed = (obj == id || fg) && !is_key(k, c);
             mask[y * ww + x] = allowed ? 1 : 0;
             if (allowed && obj == id) {
                 mask[y * ww + x] = 2;
@@ -604,24 +700,30 @@ static bool make_prop(Object *o, bool event, Prop *out)
 {
     Keys keys, base_keys;
     if (!ground_keys(o->x0, o->x1, o->y0, o->y1, event, &keys)) return false;
-    ground_keys_pct(o->x0, o->x1, o->y0, o->y1, event, &base_keys, 3);
+    ground_keys_pct(o->x0 - 1, o->x1 + 1, o->y0, o->y1, event, &base_keys, 3);
     int id = (int)(o - objects);
     /* A canopy may hang over the top half of the trunk rows, but not down to the ground. */
     int open_max = (o->y0 + (o->y1 - o->y0 + 1) / 2) * 8;
     return cut_out(id, (o->x0 - 2) * 8, (o->y0 - 8) * 8, (o->x1 - o->x0 + 5) * 8, (o->y1 - o->y0 + 9) * 8, &keys,
-                   &base_keys, o->y1 * 8 + 4, open_max, event, (o->y0 + o->y1 + 1) * 0.5f, out);
+                   &base_keys, (o->y1 > o->y0 ? o->y1 - 1 : o->y1) * 8, open_max, event,
+                   (o->y0 + o->y1 + 1) * 0.5f, out);
 }
 
 /* One column of a tree cluster: the run of solid cells ending at `base`, plus canopy above. */
 static bool make_strip(int id, int mx, int base, bool event, Prop *out)
 {
-    Keys keys;
+    Keys keys, loose;
     int top = base;
     while (top > base - 9 && object_at(mx, top - 1) == id) top--;
     if (!ground_keys(mx, mx, top, base, event, &keys)) return false;
+    /* Wider ground sample for the loose keys: a lone column sees little ground of its own. */
+    ground_keys_pct(mx - 2, mx + 2, top, base, event, &loose, 3);
     int run_top = top;
     top -= 6; /* canopy drawn above the solid part */
-    return cut_out(id, mx * 8, top * 8, 8, (base - top + 1) * 8, &keys, &keys, 1 << 30, run_top * 8, event,
+    /* Fences share no colours with grass: drop every ground colour, all the way up, so the gaps
+     * between pickets show through. Hedges are green, so only their base gets that treatment. */
+    int loose_from = objects[id].thin ? 0 : base * 8 + 4;
+    return cut_out(id, mx * 8, top * 8, 8, (base - top + 1) * 8, &keys, &loose, loose_from, run_top * 8, event,
                    base + 0.5f, out);
 }
 
@@ -669,7 +771,10 @@ static void ensure_props(int sx, int sy, bool event)
                     int top = base;
                     while (object_at(cx, top - 1) == id) top--;
                     int extra = art_rows_above(id, cx, base, &keys, event);
-                    for (int ry = top - extra; ry < top; ry++)
+                    int erase_to = o->shaped ? base - o->roof_rows : top - 1; /* behind the footprint */
+                    int erase_from = top - extra;
+                    if (o->shaped && base - o->levels + 1 < erase_from) erase_from = base - o->levels + 1;
+                    for (int ry = erase_from; ry <= erase_to; ry++)
                         for (int i = 0; i < 64; i++) {
                             int px = cx * 8 + (i & 7), py = ry * 8 + (i >> 3);
                             if (!is_key(&keys, pixel_at(px, py, event))) patch_floor(px, py, keys.c[0], event);
@@ -685,7 +790,8 @@ static void ensure_props(int sx, int sy, bool event)
                 if (!o->is_prop || o->prop_made || my != o->y1) continue;
                 o->prop_made = true;
                 if (!make_prop(o, event, &p)) {
-                    o->is_prop = false; /* fall back to a solid block */
+                    /* Nothing but ground colours: an invisible blocker. Draw nothing. */
+                    o->hidden = true;
                     continue;
                 }
             }
@@ -762,7 +868,8 @@ static float cell_height(int mx, int my, bool facades)
     int id = object_at(mx, my);
     if (id < 0) return 0;
     const Object *o = &objects[id];
-    if (o->is_prop || o->foliage) return 0;
+    if (o->is_prop || o->foliage || o->hidden) return 0;
+    if (o->shaped && facades) return 0; /* drawn as a whole model by emit_building */
     int levels = o->levels;
     if (o->terrain || o->forest) levels = tree_cell[my * EBW_MINI_W + mx] ? FOREST_LEVELS : TERRAIN_LEVELS;
     if (!facades) levels = 2;
@@ -774,6 +881,80 @@ static int column_base(int mx, int my, int id)
 {
     while (object_at(mx, my + 1) == id) my++;
     return my;
+}
+
+static int build_serial;
+
+static void tri(MeshBuf *m, Vector3 a, Vector3 b, Vector3 c, UvRect uv, unsigned char shade)
+{
+    mb_quad(m, a, b, c, c, uv, shade); /* degenerate quad */
+}
+
+/* A shaped building as one model: walls of wall_rows levels on a footprint roof_rows deep, topped
+ * by a pitched (gable) or flat roof wearing the roof art. */
+static void emit_building(MeshBuf *m, int id, bool event)
+{
+    const Object *o = &objects[id];
+    float s = OUTDOOR_SCALE;
+    int W = o->wall_rows, R = o->roof_rows;
+    float yw = W * s, yr = yw + (o->gable ? R * 0.5f * s : 0);
+    for (int mx = o->x0; mx <= o->x1; mx++) {
+        int base = column_bottom(id, mx, o->y0, o->y1);
+        if (base < 0) continue;
+        float x = (float)mx, zf = base + 1.0f, zb = zf - R, zr = (zf + zb) * 0.5f;
+        bool west_open = column_bottom(id, mx - 1, o->y0, o->y1) < 0;
+        bool east_open = column_bottom(id, mx + 1, o->y0, o->y1) < 0;
+        /* Siding for ends and back: an inner column's wall art. */
+        int inner = west_open ? mx + 1 : east_open ? mx - 1 : mx;
+        int inner_base = column_bottom(id, inner, o->y0, o->y1);
+        if (inner_base < 0) {
+            inner = mx;
+            inner_base = base;
+        }
+        for (int k = 0; k < W; k++) {
+            float ya = k * s, yb = (k + 1) * s;
+            UvRect front = minitile_uv(mx, base - k, event);
+            UvRect siding = minitile_uv(inner, inner_base - k, event);
+            mb_quad(m, (Vector3){x, yb, zf}, (Vector3){x + 1, yb, zf}, (Vector3){x + 1, ya, zf}, (Vector3){x, ya, zf},
+                    front, 230);
+            mb_quad(m, (Vector3){x + 1, yb, zb}, (Vector3){x, yb, zb}, (Vector3){x, ya, zb}, (Vector3){x + 1, ya, zb},
+                    siding, 150);
+            for (int j = 0; j < R; j++) {
+                float za = zb + j, zc = zb + j + 1;
+                if (west_open)
+                    mb_quad(m, (Vector3){x, yb, za}, (Vector3){x, yb, zc}, (Vector3){x, ya, zc}, (Vector3){x, ya, za},
+                            siding, 190);
+                if (east_open)
+                    mb_quad(m, (Vector3){x + 1, yb, zc}, (Vector3){x + 1, yb, za}, (Vector3){x + 1, ya, za},
+                            (Vector3){x + 1, ya, zc}, siding, 190);
+            }
+        }
+        /* Gable ends: triangles of siding under the roof. */
+        if (o->gable) {
+            UvRect siding = minitile_uv(inner, inner_base - W + 1, event);
+            if (west_open) tri(m, (Vector3){x, yw, zb}, (Vector3){x, yw, zf}, (Vector3){x, yr, zr}, siding, 185);
+            if (east_open) tri(m, (Vector3){x + 1, yw, zf}, (Vector3){x + 1, yw, zb}, (Vector3){x + 1, yr, zr}, siding, 185);
+        }
+        /* Roof: the art rows above the wall, eave first. */
+        for (int j = 0; j < R; j++) {
+            UvRect uv = minitile_uv(mx, base - W - j, event);
+            if (o->gable) {
+                /* Front slope climbs from the front eave to the ridge; the back slope mirrors it. */
+                float t0 = (float)j / R, t1 = (float)(j + 1) / R;
+                float fz0 = zf + (zr - zf) * t0, fz1 = zf + (zr - zf) * t1;
+                float bz0 = zb + (zr - zb) * t0, bz1 = zb + (zr - zb) * t1;
+                float y0 = yw + (yr - yw) * t0, y1 = yw + (yr - yw) * t1;
+                mb_quad(m, (Vector3){x, y1, fz1}, (Vector3){x + 1, y1, fz1}, (Vector3){x + 1, y0, fz0},
+                        (Vector3){x, y0, fz0}, uv, 240);
+                mb_quad(m, (Vector3){x + 1, y1, bz1}, (Vector3){x, y1, bz1}, (Vector3){x, y0, bz0},
+                        (Vector3){x + 1, y0, bz0}, uv, 170);
+            } else {
+                float za = zf - j - 1, zc = zf - j;
+                mb_quad(m, (Vector3){x, yw, za}, (Vector3){x + 1, yw, za}, (Vector3){x + 1, yw, zc},
+                        (Vector3){x, yw, zc}, uv, 235);
+            }
+        }
+    }
 }
 
 static void build_chunk(int sx, int sy, const W3dOptions *opt)
@@ -790,6 +971,19 @@ static void build_chunk(int sx, int sy, const W3dOptions *opt)
             mb_quad(&m, (Vector3){x0, 0, z0}, (Vector3){x0 + 4, 0, z0}, (Vector3){x0 + 4, 0, z0 + 4},
                     (Vector3){x0, 0, z0 + 4}, slot_uv(floor_slot(tx, ty, event), 0, 0, 32, 32), 255);
         }
+
+    /* Whole-model buildings, emitted by the chunk holding their bottom-left corner. */
+    build_serial++;
+    if (facades)
+        for (int my = sy * CHUNK_MH; my < (sy + 1) * CHUNK_MH; my++)
+            for (int mx = sx * CHUNK_MW; mx < (sx + 1) * CHUNK_MW; mx++) {
+                int id = object_at(mx, my);
+                if (id < 0) continue;
+                Object *o = &objects[id];
+                if (!o->shaped || o->emitted_build == build_serial || mx != o->fx || my != o->fy) continue;
+                o->emitted_build = build_serial;
+                emit_building(&m, id, event);
+            }
 
     for (int my = sy * CHUNK_MH; my < (sy + 1) * CHUNK_MH; my++)
         for (int mx = sx * CHUNK_MW; mx < (sx + 1) * CHUNK_MW; mx++) {
@@ -904,6 +1098,7 @@ void w3d_invalidate(void)
     if (analysed)
         for (int i = 0; i < object_count; i++) {
             objects[i].prop_made = false;
+            objects[i].hidden = false;
             objects[i].is_prop = looks_like_prop(&objects[i]);
         }
 }

@@ -34,6 +34,9 @@ bool ebw_indoors_at(int tx, int ty); /* sector "setting" says indoors */
 
 uint16_t ebw_tile_at(int tx, int ty); /* arrangement index 0-1023 */
 uint8_t ebw_collision_at(int mx, int my); /* minitile coordinates */
+/* True if the minitile is drawn in front of Ness (its collision hides part of his sprite): the
+ * parts of buildings and trees he walks behind. */
+bool ebw_foreground_at(int mx, int my);
 
 /* Renders one 32x32 map tile as RGBA8888. `event_palette` picks the palette variant some areas
  * switch to after a story event, when one exists. */

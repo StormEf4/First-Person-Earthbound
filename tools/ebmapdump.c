@@ -43,6 +43,14 @@ int main(int argc, char **argv)
                 for (int px = 0; px < 32 / div; px++)
                     img[(size_t)(y * 32 / div + py) * w + x * 32 / div + px] = tile[py * div * 32 + px * div];
         }
+    /* EBMAPDUMP_FG=1: tint foreground (priority) minitiles magenta. */
+    if (getenv("EBMAPDUMP_FG") && div == 1)
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                if (ebw_foreground_at(tx * 4 + x / 8, ty * 4 + y / 8)) {
+                    uint32_t c = img[(size_t)y * w + x];
+                    img[(size_t)y * w + x] = (((c & 0xFEFEFE) >> 1) | 0x800080) | 0xFF000000u;
+                }
     Image out = {img, w, h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
     ExportImage(out, argv[2]);
     printf("wrote %dx%d\n", w, h);

@@ -19,6 +19,7 @@ The single source of truth for decisions. Newest entries at the bottom of each s
 - **Indoor flag:** the sector misc table at `0x17B200` has 2 bytes per sector; `byte0 & 7` is the setting (1 = indoors, 7 = indoors with butterflies).
 - **3D object classes** (world3d.c `analyse_world`): props are ≤6x6 minitiles and ≤30 cells, outdoors. Foliage is ≥50% green pixels on the day palette, or thin (≤2 wide or tall). Terrain is wider or taller than 48, or area >200 with fill <0.5. Everything else is a building. Debug with `--class-map`: yellow prop, cyan foliage, blue terrain, red building.
 - **Reference photos:** shot list = `y{py}_x{px}_d{deg}.png  px py yawdeg pitchdeg [height]` for py 64..2047 and px 704..3199 (step 128), plus overhead (height 30, pitch -40, step 384). Cells inside solid objects are skipped (825 images, about 45 s). Generator: see Session 2.
+- **Walk-behind cells:** collision flags 0x01/0x02 (`ebw_foreground_at`) mark the art drawn in front of Ness: house roofs, tree canopies (upper part only), sign boards, and tops of tall buildings. The SNES priority bit is NOT used for this in EarthBound (it's always 0 on map tiles). Debug: `EBMAPDUMP_FG=1 ebmapdump rom out.png tx ty tw th 1`.
 - **Cloud session network:** github.com git clones work; GitHub release downloads and buildbot.libretro.com are blocked; PyPI works. So we build tools from source (cc65, snes9x core, raylib).
 
 ## Open questions
@@ -59,6 +60,7 @@ Q1–Q13 are answered (D3–D12, D17–D19). Still open:
 | D25 | 2026-10-10 | Claude has no access to the user's screen or capture software in cloud sessions. Visual checks use FPEB screenshots taken in the cloud with the user's ROM (see the "How to test" notes). | The user believed screen capture had been set up; it isn't reachable from here |
 | D26 | 2026-10-11 | 3D conversion follows EarthBound's oblique projection. A building's collision is its footprint, and its wall height is how far its art rises above that footprint. The whole art stands up as the front wall, at one height per building (median over its columns), and the copy painted on the ground behind it is erased. Bulky cells (inside a solid 3x3) and thin cells are grouped separately, so fences and hedges don't fuse with buildings. Hand blueprints (`src/blueprints.c`) can override any building that is still wrong. | User: "the entire town is a jumbled mess". The reference survey showed misclassified merged objects and road art cut out with signs |
 | D27 | 2026-10-11 | Claude keeps a large reference-photo set to judge visuals: `FPEB --shot-list` batch renders an Onett grid (128 px step, 4 directions, plus overhead views) into the scratchpad `refs/` folder, alongside `--class-map` and `ebmapdump` top-down maps. Regenerate after every visual change and compare before and after. | User: "take as many reference photos for urself as possible" |
+| D28 | 2026-10-11 | **The walk-behind flags are ground truth for "what stands up".** EarthBound marks the cells Ness walks behind (collision bits 0x01/0x02, which hide part of his sprite). Above a solid footprint those cells are the roof or canopy, and roads and lawns are never marked. Buildings: solid rows = front wall height W, walk-behind rows = roof and depth R. Each building is one model with a pitched gable (saturated roof colour, R ≥ 3) or a flat roof. Cut-outs take only walk-behind cells, plus the two rows under them for leafy things. Any object made of thin (non-bulky) cells is a cut-out strip. | User: fences blend with grass, tree roots awkward, roofs should be sloped like in the game |
 
 ## Session History
 
@@ -103,3 +105,10 @@ Q1–Q13 are answered (D3–D12, D17–D19). Still open:
   - Side and back walls repeat the lower half (walls), so roof art only shows on the front.
 - **Next:** the user reviews the new build. Blueprint any remaining bad buildings. Then Phase 2.
 - Regenerate refs: write the list with the Python snippet (grid as above) to `/tmp/ref_list.txt`, then `printf "res=4\nfog=2\n" > build/fpeb.ini; xvfb-run -a build/FPEB --rom $PWD/roms/earthbound.smc --core build/snes9x_libretro.so --shot-list /tmp/ref_list.txt`.
+- Round 3 (same session): the user asked for see-through fences, better tree roots, sloped roofs, and 3D-sensible design tweaks.
+  - Found the walk-behind signal (D28) and rebuilt building heights and cut-outs on it.
+  - Buildings are now whole models with gable or flat roofs (`emit_building`).
+  - Fences get loose ground keying, thin cells always become strips, and the ground sample never takes leafy cells (single-cell trunks were losing their canopies).
+  - Art-less blocker cells are hidden.
+  - Verified with full reference passes.
+  - Known leftovers: hills aren't raised plateaus (cliffs are 2-level ledges); forest masses are flat-topped walls; an odd striped tall object near (1000,1470).
