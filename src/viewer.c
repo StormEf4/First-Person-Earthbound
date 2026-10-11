@@ -57,6 +57,34 @@ void viewer_set_angles(float yaw_deg, float pitch_deg)
 
 void viewer_set_height(float units) { pos.y = units; }
 
+void viewer_set_option(int id, int value)
+{
+    if (id >= 0 && id < OPT_COUNT && value >= 0 && value < w3d_option_count(id) && opt.value[id] != value) {
+        opt.value[id] = value;
+        if (id == OPT_WALL_STYLE || id == OPT_PALETTE) w3d_invalidate();
+    }
+}
+
+/* Renders the current view repeatedly until every chunk in sight is built, then saves it. */
+bool viewer_snapshot(const char *path)
+{
+    for (int i = 0; i < 120; i++) {
+        BeginDrawing();
+        viewer_draw(false);
+        EndDrawing();
+        if (!w3d_pending()) break;
+    }
+    BeginDrawing();
+    viewer_draw(false);
+    EndDrawing();
+    /* Save the low-res frame itself, at its native size. */
+    Image img = LoadImageFromTexture(target.texture);
+    ImageFlipVertical(&img);
+    bool ok = ExportImage(img, path);
+    UnloadImage(img);
+    return ok;
+}
+
 static Vector3 forward(void) { return (Vector3){sinf(yaw), 0, -cosf(yaw)}; }
 
 bool viewer_update(float dt)

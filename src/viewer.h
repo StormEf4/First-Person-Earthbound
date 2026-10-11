@@ -15,6 +15,10 @@ void viewer_config_write(FILE *f);
 void viewer_place(float px, float py, int direction);
 void viewer_set_angles(float yaw_deg, float pitch_deg);
 void viewer_set_height(float units);
+void viewer_set_option(int id, int value);
+
+/* Test/reference tool: renders until the view is complete and saves a PNG to any path. */
+bool viewer_snapshot(const char *path);
 
 /* Returns true if an option changed (so the caller can save the config). */
 bool viewer_update(float dt);

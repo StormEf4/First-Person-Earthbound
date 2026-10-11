@@ -35,6 +35,11 @@ bool w3d_is_solid(float x, float z);
 
 /* Debug: logs the object under a map pixel. */
 void w3d_probe(int px, int py);
-/* Debug: writes a top-down PNG with objects tinted by class (yellow prop, cyan foliage, blue
- * terrain, red building). */
+/* Debug: writes a top-down PNG with objects tinted by class (yellow prop, cyan foliage, dark
+ * green forest, blue terrain, red building). */
 void w3d_class_map(const char *path, int tx, int ty, int tw, int th);
+
+/* True if the last frame still had chunks waiting to be built (the view isn't complete yet). */
+bool w3d_pending(void);
+/* Debug: writes every object's box and class as CSV. */
+void w3d_dump_objects(const char *path);

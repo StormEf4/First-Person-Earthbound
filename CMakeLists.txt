@@ -19,6 +19,7 @@ add_executable(fpeb
     src/rom_check.c
     src/eb_world.c
     src/world3d.c
+    src/blueprints.c
     src/viewer.c
     src/log.c)
 target_include_directories(fpeb PRIVATE src third_party/libretro)

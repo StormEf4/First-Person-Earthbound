@@ -12,6 +12,7 @@
 #include "lr_host.h"
 #include "rom_check.h"
 #include "viewer.h"
+#include "world3d.h"
 
 #define APP_TITLE "First-Person EarthBound"
 #define CONFIG_FILE "fpeb.ini"
@@ -332,6 +333,8 @@ int main(int argc, char **argv)
     float cam_y = -1;                /* --cam-y units */
     int probe[16][2], nprobe = 0;    /* --probe px py: log the object there */
     const char *class_map = NULL;    /* --class-map file tx ty tw th */
+    const char *dump_objects = NULL; /* --dump-objects file.csv */
+    const char *shot_list = NULL;    /* --shot-list file: lines "out.png px py yaw pitch [height]" */
     int class_rect[4] = {0};
 
     /* Keep config, log, and saves next to the program even if launched from elsewhere. */
@@ -349,6 +352,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--cam") && i + 4 < argc)
             for (int k = 0; k < 4; k++) cam[k] = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--cam-y") && i + 1 < argc) cam_y = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--shot-list") && i + 1 < argc) shot_list = argv[++i];
+        else if (!strcmp(argv[i], "--dump-objects") && i + 1 < argc) dump_objects = argv[++i];
         else if (!strcmp(argv[i], "--class-map") && i + 5 < argc) {
             class_map = argv[++i];
             for (int k = 0; k < 4; k++) class_rect[k] = atoi(argv[++i]);
@@ -381,6 +386,26 @@ int main(int argc, char **argv)
     view3d = view3d && world_ok;
     for (int i = 0; i < nprobe && world_ok; i++) w3d_probe(probe[i][0], probe[i][1]);
     if (class_map && world_ok) w3d_class_map(class_map, class_rect[0], class_rect[1], class_rect[2], class_rect[3]);
+    if (dump_objects && world_ok) w3d_dump_objects(dump_objects);
+    if (shot_list && world_ok) {
+        /* Reference-photo batch: one process renders many camera positions. */
+        FILE *f = fopen(shot_list, "r");
+        char line[1200], out[1024];
+        float px, py, yaw, pitch, height;
+        int n = 0;
+        while (f && fgets(line, sizeof line, f)) {
+            height = 2.5f;
+            if (sscanf(line, "%1023s %f %f %f %f %f", out, &px, &py, &yaw, &pitch, &height) < 5) continue;
+            if (height < 5 && w3d_is_solid(px / 8, py / 8)) continue; /* inside something: useless */
+            viewer_place(px, py, 0);
+            viewer_set_angles(yaw, pitch);
+            viewer_set_height(height);
+            if (viewer_snapshot(out)) n++;
+        }
+        if (f) fclose(f);
+        log_msg("shot-list: saved %d images\n", n);
+        test_frames = 0;
+    }
     if (view3d) {
         if (cam[0] >= 0) {
             viewer_place(cam[0], cam[1], 0);

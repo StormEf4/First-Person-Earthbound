@@ -18,6 +18,7 @@ The single source of truth for decisions. Newest entries at the bottom of each s
 - **Ness's front door** is at about pixel (2400, 343).
 - **Indoor flag:** the sector misc table at `0x17B200` has 2 bytes per sector; `byte0 & 7` is the setting (1 = indoors, 7 = indoors with butterflies).
 - **3D object classes** (world3d.c `analyse_world`): props are ≤6x6 minitiles and ≤30 cells, outdoors. Foliage is ≥50% green pixels on the day palette, or thin (≤2 wide or tall). Terrain is wider or taller than 48, or area >200 with fill <0.5. Everything else is a building. Debug with `--class-map`: yellow prop, cyan foliage, blue terrain, red building.
+- **Reference photos:** shot list = `y{py}_x{px}_d{deg}.png  px py yawdeg pitchdeg [height]` for py 64..2047 and px 704..3199 (step 128), plus overhead (height 30, pitch -40, step 384). Cells inside solid objects are skipped (825 images, about 45 s). Generator: see Session 2.
 - **Cloud session network:** github.com git clones work; GitHub release downloads and buildbot.libretro.com are blocked; PyPI works. So we build tools from source (cc65, snes9x core, raylib).
 
 ## Open questions
@@ -56,6 +57,8 @@ Q1–Q13 are answered (D3–D12, D17–D19). Still open:
 | D23 | 2026-10-10 | Wall height is decided by context, not chosen by the player: **low indoors, tall outdoors**. Use the sector's Indoors setting. | User |
 | D24 | 2026-10-10 | Lighting mood and day/night palette **change with context** (scene, story, mood), driven by game state rather than a player setting. The Phase 1 hotkeys stay as debug overrides. | User |
 | D25 | 2026-10-10 | Claude has no access to the user's screen or capture software in cloud sessions. Visual checks use FPEB screenshots taken in the cloud with the user's ROM (see the "How to test" notes). | The user believed screen capture had been set up; it isn't reachable from here |
+| D26 | 2026-10-11 | 3D conversion follows EarthBound's oblique projection. A building's collision is its footprint, and its wall height is how far its art rises above that footprint. The whole art stands up as the front wall, at one height per building (median over its columns), and the copy painted on the ground behind it is erased. Bulky cells (inside a solid 3x3) and thin cells are grouped separately, so fences and hedges don't fuse with buildings. Hand blueprints (`src/blueprints.c`) can override any building that is still wrong. | User: "the entire town is a jumbled mess". The reference survey showed misclassified merged objects and road art cut out with signs |
+| D27 | 2026-10-11 | Claude keeps a large reference-photo set to judge visuals: `FPEB --shot-list` batch renders an Onett grid (128 px step, 4 directions, plus overhead views) into the scratchpad `refs/` folder, alongside `--class-map` and `ebmapdump` top-down maps. Regenerate after every visual change and compare before and after. | User: "take as many reference photos for urself as possible" |
 
 ## Session History
 
@@ -83,3 +86,20 @@ Q1–Q13 are answered (D3–D12, D17–D19). Still open:
 - Test ROM: `ca65 tests/testrom/testrom.s -o t.o && ld65 -C tests/testrom/testrom.cfg -o testrom.sfc t.o`.
 - Screenshot the 3D view with the real ROM: `FPEB --rom $PWD/../roms/earthbound.smc --core ... --view3d --cam PX PY YAWDEG PITCHDEG [--cam-y UNITS] [--set walls=1 ...] --frames 45 --screenshot x.png`. Put `debug=0` in `build/fpeb.ini` to hide the panel. Run these one at a time, since they share fpeb.ini.
 - Run: `xvfb-run -a ./build/FPEB --rom /abs/testrom.sfc --core /abs/snes9x_libretro.so --any-rom --debug --frames 120 --screenshot shot.png`. raylib saves the screenshot in the program's folder, whatever path you give.
+
+### Session 2 — 2026-10-11
+- User: "the entire town is a jumbled mess", then "take as many reference photos for urself as possible". Added the `--shot-list` batch renderer (native 640x360 frames, completes chunk building before saving), `--dump-objects`, and the `--class-map` legend. Captured 825 eye-level and overhead shots of Onett plus top-down class and art maps.
+- Root causes found in the survey:
+  1. Signs and stop signs cut out together with the road around them (giant pale slabs).
+  2. Buildings fused with fences, hedges, and lawn trees, then misclassified as cliffs and flattened.
+  3. The mansion and forest colour tests were wrong.
+  4. Building heights didn't follow the projection.
+- Fixes:
+  - Cut-outs only take open pixels above the object, with strict ground keys (dominant colours) and loose keys at the trunk base for painted shadows.
+  - Bulky/thin split before grouping.
+  - Forest class plus per-cell tree walls inside cliff and forest masses.
+  - Walls drawn wherever a neighbour is lower (height field).
+  - Building height from the art above the footprint (D26), with floor erasure.
+  - Side and back walls repeat the lower half (walls), so roof art only shows on the front.
+- **Next:** the user reviews the new build. Blueprint any remaining bad buildings. Then Phase 2.
+- Regenerate refs: write the list with the Python snippet (grid as above) to `/tmp/ref_list.txt`, then `printf "res=4\nfog=2\n" > build/fpeb.ini; xvfb-run -a build/FPEB --rom $PWD/roms/earthbound.smc --core build/snes9x_libretro.so --shot-list /tmp/ref_list.txt`.
