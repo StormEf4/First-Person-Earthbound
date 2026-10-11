@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "eb_world.h"
+#include "tree_match.h"
 #include "raymath.h"
 #include "rlgl.h"
 
@@ -712,6 +713,38 @@ static void solve_ground(void)
     link_lists(rises, nr, n, &st, &ot, &dl);
     cg_solve(ground, dom, st, ot, dl, 600);
     free(st), free(ot), free(dl);
+
+    /* Flatten: grow regions of ground within half a unit of their seed and set each to its mean.
+     * Level ground comes out dead flat; real slopes become gentle steps that the corner averaging
+     * smooths back out. */
+    {
+        int32_t *reg = malloc(sizeof(int32_t) * n), *q = malloc(sizeof(int32_t) * n);
+        memset(reg, 0xFF, sizeof(int32_t) * n);
+        int nreg = 0;
+        for (int c0 = 0; c0 < n; c0++) {
+            if (!dom[c0] || reg[c0] >= 0) continue;
+            float seed = ground[c0];
+            int qh = 0, qt = 0;
+            q[qt++] = c0;
+            reg[c0] = nreg;
+            double sum = 0;
+            while (qh < qt) {
+                int c = q[qh++], x = c % EBW_MINI_W, y = c / EBW_MINI_W;
+                sum += ground[c];
+                const int nb[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+                for (int k = 0; k < 4; k++) {
+                    int nx = x + nb[k][0], ny = y + nb[k][1];
+                    if (nx < 0 || ny < 0 || nx >= EBW_MINI_W || ny >= EBW_MINI_H) continue;
+                    int ni = ny * EBW_MINI_W + nx;
+                    if (dom[ni] && reg[ni] < 0 && fabsf(ground[ni] - seed) < 0.5f) reg[ni] = nreg, q[qt++] = ni;
+                }
+            }
+            float mean = (float)(sum / qt);
+            for (int i = 0; i < qt; i++) ground[q[i]] = mean;
+            nreg++;
+        }
+        free(reg), free(q);
+    }
     free(th), free(trises), free(self_rise), free(terr);
 
     float *cliff_top = malloc(sizeof(float) * n);
@@ -1167,7 +1200,7 @@ typedef struct {
 } FenceSeg;
 
 typedef struct {
-    bool built, has_mesh, props_done;
+    bool built, has_mesh, props_done, trees_done;
     Mesh mesh;
     Prop *props;
     int nprops;
@@ -1294,6 +1327,76 @@ static void plant_forest(Chunk *c, int sx, int sy, bool event)
         }
 }
 
+/* ---- matched trees ---- */
+
+static int tm_event = -1;          /* palette the tree sprites were cut with; -1 = not yet */
+static Rectangle tm_rect[8];       /* where each sprite sits in the prop atlas */
+static uint8_t *tm_claim;          /* minitiles whose solid cells belong to a matched tree */
+
+static void ensure_tree_sprites(bool event)
+{
+    if (tm_event == (event ? 1 : 0)) return;
+    tm_event = event ? 1 : 0;
+    int n = tm_init(pixel_at, event, ebw_tileset_at);
+    for (int i = 0; i < n && i < 8; i++) {
+        const TreeSprite *t = tm_sprite(i);
+        if (pack_prop(t->w, t->h, &tm_rect[i])) UpdateTextureRec(prop_atlas, tm_rect[i], t->px);
+        if (getenv("FPEB_DUMP_TREES")) {
+            Image im = {(void *)t->px, t->w, t->h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+            ExportImage(im, TextFormat("/tmp/tm_%d.png", i));
+        }
+    }
+    if (!tm_claim) tm_claim = calloc(EBW_MINI_W * EBW_MINI_H, 1);
+    else memset(tm_claim, 0, EBW_MINI_W * EBW_MINI_H);
+    TraceLog(LOG_INFO, "trees: %d sprite(s) cut", n);
+}
+
+/* Finds the trees standing in a chunk: each becomes a clean sprite, its painted copy is wiped
+ * off the ground, and the collision objects under its trunk are claimed so nothing else draws
+ * them. */
+static void detect_trees(int sx, int sy, bool event)
+{
+    if (sx < 0 || sy < 0 || sx >= EBW_SECTORS_X || sy >= EBW_SECTORS_Y) return;
+    Chunk *c = &chunks[sy][sx];
+    if (c->trees_done) return;
+    c->trees_done = true;
+    ensure_tree_sprites(event);
+    static TreeMatch found[256];
+    int n = tm_find(sx * CHUNK_MW * 8, sy * CHUNK_MH * 8, (sx + 1) * CHUNK_MW * 8, (sy + 1) * CHUNK_MH * 8, event,
+                    found, 256);
+    for (int i = 0; i < n; i++) {
+        const TreeSprite *t = tm_sprite(found[i].sprite);
+        int ox = found[i].x, oy = found[i].y;
+        for (int y = 0; y < t->h; y++)
+            for (int x = 0; x < t->w; x++) {
+                uint32_t p = t->px[y * t->w + x];
+                if (p >> 24 && pixel_at(ox + x, oy + y, event) == p) patch_floor(ox + x, oy + y, t->grass, event);
+            }
+        /* Claim the solid cells under the lower part (trunk and roots). */
+        for (int my = (oy + t->h / 2) / 8; my <= (oy + t->h - 1) / 8; my++)
+            for (int mx = ox / 8; mx <= (ox + t->w - 1) / 8; mx++)
+                if (mx >= 0 && my >= 0 && mx < EBW_MINI_W && my < EBW_MINI_H && solid(mx, my)) {
+                    tm_claim[my * EBW_MINI_W + mx] = 1;
+                    int id = object_at(mx, my);
+                    if (id >= 0 && objects[id].cells <= 400) objects[id].hidden = true;
+                }
+        Prop p = {0};
+        p.src = tm_rect[found[i].sprite];
+        p.w = t->w / 8.0f;
+        p.h = t->h / 8.0f;
+        p.x = (ox + t->w * 0.5f) / 8.0f;
+        p.z = (oy + t->h) / 8.0f - 0.4f;
+        p.y = ground_at((int)p.x, (int)(p.z));
+        chunk_add_prop(c, p);
+    }
+    /* Inside forest masses, canopy left over from trees hidden behind others becomes grass. */
+    if (tm_count() > 0)
+        for (int my = sy * CHUNK_MH; my < (sy + 1) * CHUNK_MH; my++)
+            for (int mx = sx * CHUNK_MW; mx < (sx + 1) * CHUNK_MW; mx++)
+                if (tree_cell[my * EBW_MINI_W + mx] && kind_at(mx, my) == CELL_GROUND)
+                    for (int i = 0; i < 64; i++) patch_floor(mx * 8 + (i & 7), my * 8 + (i >> 3), tm_sprite(0)->grass, event);
+}
+
 /* Cuts out the props whose base lies in this chunk. Their canopies can reach into the chunk to
  * the north, so a chunk's floor is built only after its southern neighbours have run this. */
 static void ensure_props(int sx, int sy, bool event)
@@ -1302,12 +1405,15 @@ static void ensure_props(int sx, int sy, bool event)
     Chunk *c = &chunks[sy][sx];
     if (c->props_done) return;
     c->props_done = true;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) detect_trees(sx + dx, sy + dy, event);
     for (int my = sy * CHUNK_MH; my < (sy + 1) * CHUNK_MH; my++)
         for (int mx = sx * CHUNK_MW; mx < (sx + 1) * CHUNK_MW; mx++) {
             int id = object_at(mx, my);
             if (id < 0) continue;
             Object *o = &objects[id];
             Prop p;
+            if (o->hidden || (tm_claim && tm_claim[my * EBW_MINI_W + mx])) continue;
             bool building = !o->indoors && !o->is_prop && !o->foliage && !o->forest && !o->terrain && !o->cliff &&
                             !o->voidc;
             if (building) {
@@ -1360,7 +1466,7 @@ static void ensure_props(int sx, int sy, bool event)
             c->props = realloc(c->props, sizeof(Prop) * (c->nprops + 1));
             c->props[c->nprops++] = p;
         }
-    plant_forest(c, sx, sy, event);
+    (void)plant_forest; /* forests are now matched tree by tree */
 }
 
 typedef struct {
@@ -1740,6 +1846,7 @@ void w3d_invalidate(void)
     slots_used = 0;
     shelf_x = shelf_y = shelf_h = 0;
     tree_tpl_count = 0;
+    tm_event = -1;
     atlas_full = false;
     if (analysed)
         for (int i = 0; i < object_count; i++) {
